@@ -1317,15 +1317,31 @@ class RayPPOTrainer:
 
     def fit(self):
         """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
+        PPO 训练主循环。
+        
+        【核心设计理念】
+        verl 采用 HybridFlow 架构，将控制逻辑（driver进程）与计算逻辑（worker进程）分离：
+        - driver 进程：负责调度、数据流编排、轻量级计算（如 advantage 计算）
+        - worker 进程：负责重计算任务（如模型推理、梯度计算）
+        
+        driver 进程通过 Ray RPC 调用 worker group 的计算函数来构建 PPO 数据流。
+        轻量级的 advantage 计算在 driver 进程上完成，避免不必要的通信开销。
+        
+        【PPO 训练流程概览】
+        1. 初始化：加载检查点、设置日志、预训练验证
+        2. Rollout 阶段：使用 actor 生成响应序列
+        3. 评估阶段：计算 reward、value、log_prob
+        4. 优势估计：计算 advantage（GAE/GRPO/REINFORCE++ 等）
+        5. 策略更新：使用 PPO 目标函数更新 actor 和 critic
+        6. 验证与保存：定期验证模型性能，保存检查点
         """
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
 
+        # ========== 第一阶段：初始化日志追踪器 ==========
+        # Tracking 支持多种后端：wandb、tensorboard、console 等
+        # 【注意】确保 config 中正确配置了 project_name 和 experiment_name
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1333,97 +1349,164 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        # 初始化全局步数计数器
+        # 【注意】如果从检查点恢复，此值会被 _load_checkpoint 覆盖
         self.global_steps = 0
 
-        # load checkpoint before doing anything
+        # ========== 第二阶段：加载检查点（断点续训支持）==========
+        # 【重要】这一步必须在任何训练操作之前执行
+        # 检查点包含：模型权重、优化器状态、global_steps、dataloader 状态等
         self._load_checkpoint()
 
+        # 根据 global_steps 计算当前 epoch，支持中断恢复后继续从正确位置训练
         current_epoch = self.global_steps // len(self.train_dataloader)
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
+        # ========== 第三阶段：训练前验证（可选）==========
+        # 在训练开始前进行一次验证，记录初始模型性能作为 baseline
+        # 【配置项】val_before_train=True（默认开启）
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            # 【特殊模式】val_only=True 时仅执行验证，不进行训练
             if self.config.trainer.get("val_only", False):
                 return
 
+        # ========== 第四阶段：Rollout Skip 功能（可选）==========
+        # 【高级功能】跳过 rollout，直接使用预生成的数据进行训练
+        # 适用场景：调试、离线训练、加速实验迭代
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
             rollout_skip.wrap_generate_sequences()
 
-        # add tqdm
+        # 初始化进度条，显示训练进度
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
-        # we start from step 1
+        # ========== 第五阶段：训练状态初始化 ==========
+        # 【注意】global_steps 从 1 开始计数（而非 0）
         self.global_steps += 1
-        last_val_metrics = None
-        self.max_steps_duration = 0
+        last_val_metrics = None  # 保存最后一次验证的 metrics，用于最终输出
+        self.max_steps_duration = 0  # 记录最长单步耗时，用于 ESI 检查点保存策略
 
-        prev_step_profile = False
+        # ========== 性能分析（Profiling）状态机 ==========
+        # 支持指定特定步骤进行性能分析，用于定位性能瓶颈
+        # 【配置项】global_profiler.steps = [10, 20, 30] 表示在这些步骤进行 profiling
+        # 【配置项】profile_continuous_steps=True 表示连续步骤只开启/关闭一次 profiler
+        prev_step_profile = False  # 上一步是否在 profiling
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
             if self.config.global_profiler.steps is not None
             else False
         )
-        next_step_profile = False
+        next_step_profile = False  # 下一步是否需要 profiling
 
+        # ╔══════════════════════════════════════════════════════════════════════════════╗
+        # ║                           PPO 训练主循环                                      ║
+        # ║  外层循环：遍历 epoch                                                         ║
+        # ║  内层循环：遍历每个 batch，执行完整的 PPO 更新                                ║
+        # ╚══════════════════════════════════════════════════════════════════════════════╝
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                # ========== 异步调用处理 ==========
+                # 【异步训练模式】处理上一步的异步操作（非阻塞）
+                # 用于异步 rollout 或异步知识蒸馏等高级场景
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
-                metrics = {}
-                timing_raw = {}
+                
+                # 初始化本步骤的 metrics 收集器和计时器
+                metrics = {}       # 收集所有训练指标，最终写入日志
+                timing_raw = {}    # 收集各阶段耗时，用于性能分析
 
+                # ========== 性能分析启动 ==========
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+                
+                # ========== 数据准备阶段 ==========
+                # 将 batch_dict 转换为 verl 的 DataProto 格式
+                # 【DataProto】verl 的核心数据结构，包含：
+                #   - batch: 张量数据（input_ids, attention_mask 等）
+                #   - non_tensor_batch: 非张量数据（uid, prompts 等）
+                #   - meta_info: 元信息（temperature, global_steps 等）
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # 设置生成时的采样温度（影响输出多样性）
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # add uid to batch
+                # 为每个样本分配唯一标识符（uid）
+                # 【重要】uid 用于 GRPO 等算法中按问题分组计算 advantage
+                # 同一个 prompt 生成的多个 response 共享同一个 uid
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # 获取生成所需的 batch（可能进行预处理）
                 gen_batch = self._get_gen_batch(batch)
 
-                # pass global_steps to trace
+                # 传递 global_steps 用于 trace 追踪和调试
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                
+                # ========== 样本重复（n 次采样）==========
+                # 【核心概念】每个 prompt 生成 n 个 response（rollout.n 配置）
+                # interleave=True 表示交错排列：[p1_r1, p1_r2, p2_r1, p2_r2, ...]
+                # 这对于 GRPO 等需要同组比较的算法至关重要
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
+                # 判断是否为最后一步（用于触发最终验证和保存）
                 is_last_step = self.global_steps >= self.total_training_steps
+                # ╔══════════════════════════════════════════════════════════════════════════════╗
+                # ║                         单步 PPO 更新开始                                      ║
+                # ║  包含：生成 → 奖励计算 → 优势估计 → Critic更新 → Actor更新                    ║
+                # ╚══════════════════════════════════════════════════════════════════════════════╝
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 1】Rollout 生成阶段
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 使用当前策略 π_θ 生成响应序列
+                    # 【核心】这是 PPO on-policy 训练的关键步骤
+                    # 生成的数据包含：response tokens, attention_mask, rollout_log_probs 等
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
+                            # 同步模式：直接调用 actor_rollout_wg 生成序列
+                            # actor_rollout_wg 可以是 vLLM 或 SGLang 后端
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
+                            # 异步模式：使用 async_rollout_manager 进行异步生成
+                            # 【高级功能】可实现训练和生成的流水线并行
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
+                        # 提取生成阶段的计时信息并合并
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【特殊处理】REMAX 优势估计方法
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # REMAX 使用贪婪解码（greedy decoding）的结果作为 baseline
+                    # 计算 advantage 时：A = R(sampled) - R(greedy)
+                    # 【论文】REMAX: A Simple, Effective, and Efficient Method for Variance Reduction
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
                         with marked_timer("gen_max", timing_raw, color="purple"):
+                            # 创建一份副本，设置为贪婪解码模式
                             gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
+                            gen_baseline_batch.meta_info["do_sample"] = False  # 贪婪解码
+                            
+                            # 生成 baseline 序列（贪婪解码结果）
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
+                            
+                            # 计算 baseline 的奖励模型分数（如果使用 RM）
                             rm_scores = None
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
                                 if not self.use_reward_loop:
@@ -1433,68 +1516,116 @@ class RayPPOTrainer:
                                     rm_scores = self.reward_loop_manager.compute_rm_score(batch)
                                 batch = batch.union(rm_scores)
 
-                            # Compute or extract reward for REMAX baseline
+                            # 计算 REMAX baseline 的奖励值
+                            # 【注意】sum_reward=True 表示返回整个序列的总奖励（而非 token 级别）
                             reward_baseline_tensor = self._compute_or_extract_reward(
                                 batch, reward_fn=self.reward_fn, sum_reward=True
                             )
 
+                            # 清理临时数据，避免内存泄漏
                             keys_to_pop = set(gen_baseline_output.batch.keys())
                             if rm_scores is not None:
                                 keys_to_pop.update(rm_scores.batch.keys())
                             batch.pop(batch_keys=list(keys_to_pop))
 
+                            # 保存 baseline 奖励，后续用于 advantage 计算
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 2】数据整合与预处理
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 重复原始 batch 以匹配生成的多个响应
+                    # 【重要】这确保了 prompt 数据与对应的 response 数据正确对齐
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # 合并生成的输出（包含 response tokens, log_probs 等）
                     batch = batch.union(gen_batch_output)
 
+                    # 计算 response_mask：标识哪些位置是有效的响应 token
+                    # 【作用】用于 loss 计算和 advantage 计算时过滤 padding
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
+                    
+                    # ========== 负载均衡（可选但推荐）==========
+                    # 【性能优化】平衡各 DP rank 上的有效 token 数量
+                    # 【注意】这会改变 batch 中数据的顺序：
+                    #   - 不影响 advantage 计算（基于 uid 分组）
+                    #   - 可能影响 mini-batch 划分和 loss 计算
+                    # 【配置项】trainer.balance_batch=True 开启
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
+                    # 统计全局有效 token 数量（用于 throughput 计算）
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    # get images_seqlens
+                    
+                    # ========== 多模态支持（VLM 场景）==========
+                    # 提取图像序列长度信息，用于多模态模型训练
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
                         if "image_grid_thw" not in multi_modal_input.keys():
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 3】奖励计算
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # verl 支持两种奖励来源：
+                    #   1. Reward Model (RM): 神经网络奖励模型，需要 GPU 推理
+                    #   2. Reward Function: 规则函数（如正则匹配、代码执行验证）
+                    # 可以同时使用两者，最终奖励 = RM分数 + Rule分数
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
+                        # 【步骤 3.1】计算 Reward Model 分数（如果配置了 RM）
+                        # 【注意】RM 分数可能已经在 rollout 阶段计算（某些优化场景）
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             if not self.use_reward_loop:
+                                # 标准模式：直接调用 RM worker group
                                 reward_tensor = self.rm_wg.compute_rm_score(batch)
                             else:
+                                # Reward Loop 模式：支持多轮 reward 计算（如 agent 场景）
                                 assert self.reward_loop_manager is not None, "RewardLoopManager is None"
                                 reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        # Compute or extract reward for training
+                        # 【步骤 3.2】计算规则函数奖励
+                        # 支持异步计算以隐藏延迟（特别是涉及外部 API 调用时）
                         if self.config.reward_model.launch_reward_fn_async:
+                            # 【异步模式】使用 Ray remote 异步计算
+                            # future_reward 稍后在 advantage 计算前获取结果
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
                         else:
+                            # 【同步模式】直接计算奖励
+                            # reward_tensor: token 级别的奖励（通常只有 EOS 位置有值）
+                            # reward_extra_infos_dict: 额外信息（如具体得分明细）
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                 batch, reward_fn=self.reward_fn, return_dict=False
                             )
 
-                    # Operating Mode Selection:
-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 4】策略 Log Probability 计算
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【核心概念】PPO 需要计算 importance sampling ratio：
+                    #   ratio = π_θ(a|s) / π_old(a|s) = exp(log_prob_new - log_prob_old)
+                    #
+                    # 【两种模式选择】
+                    # 1. Bypass 模式（2个策略）：old_log_probs = rollout_log_probs
+                    #    - π_rollout: 生成数据时的策略
+                    #    - π_θ: 当前正在优化的策略
+                    #    - 【优点】节省一次前向传播
+                    #    - 【适用】标准 on-policy 场景
+                    #
+                    # 2. Decoupled 模式（3个策略）：重新计算 old_log_probs
+                    #    - π_rollout: 生成数据时的策略
+                    #    - π_old: 每个 batch 开始时计算一次，作为稳定的参考点
+                    #    - π_θ: 当前正在优化的策略（mini-batch 更新中不断变化）
+                    #    - 【优点】更精确的 importance sampling 修正
+                    #    - 【适用】异步训练、off-policy 修正等高级场景
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                    
+                    if bypass_recomputing_logprobs:  
+                        # 【Bypass 模式】直接使用 rollout 阶段的 log_probs
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
@@ -1502,9 +1633,16 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                    else:  # Recompute old_log_probs
+                    else:  
+                        # 【Decoupled 模式】重新计算 old_log_probs
+                        # 这需要一次额外的前向传播，但提供更准确的重要性采样
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            
+                            # 【熵计算】熵是策略探索性的度量
+                            # 高熵 = 输出分布更均匀 = 更多探索
+                            # 低熵 = 输出更确定 = 更多利用
+                            # 【调试技巧】如果熵下降过快，可能需要添加熵奖励
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1515,102 +1653,179 @@ class RayPPOTrainer:
                                 loss_scale_factor=actor_config.loss_scale_factor,
                             )
                             old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
+                                "actor/entropy": entropy_agg.detach().item(),  # 记录平均熵
+                                "perf/mfu/actor_infer": old_log_prob_mfu,       # MFU 性能指标
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
+                            
+                            # 【调试】计算 rollout_log_probs 和 old_log_probs 的差异
+                            # 如果差异过大，说明策略在 rollout 和当前步之间变化太大
+                            # 可能导致训练不稳定
                             if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
-
                                 metrics.update(calculate_debug_metrics(batch))
 
+                    # 确保 old_log_probs 已正确设置
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 5】Reference Policy 计算（KL 惩罚用）
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # Reference Policy 通常是 SFT 后的初始模型，保持冻结
+                    # 【作用】计算 KL 散度以防止策略偏离初始分布太远
+                    # KL = log π_θ(a|s) - log π_ref(a|s)
+                    # 【重要】这是 RLHF 中防止 reward hacking 的关键机制
                     if self.use_reference_policy:
-                        # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
-                    # compute values
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 6】Value 计算（Critic 网络）
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # Critic 网络估计每个状态的价值 V(s)
+                    # 【用途】用于 GAE (Generalized Advantage Estimation) 计算
+                    # 【注意】GRPO 等算法不需要 Critic，直接使用组内奖励归一化
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 7】Advantage 估计（PPO 的核心）
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【核心概念】Advantage A(s,a) = Q(s,a) - V(s)
+                    # 表示在状态 s 采取动作 a 相比于平均水平好多少
+                    # A > 0: 动作优于平均 → 增加该动作概率
+                    # A < 0: 动作劣于平均 → 降低该动作概率
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
+                        # 【步骤 7.1】获取奖励（如果是异步计算的话）
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
+                            # 等待异步奖励计算完成
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        
+                        # 设置 token 级别的原始分数（未加 KL 惩罚）
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # 保存奖励的额外信息（如各项得分明细）
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # compute rewards. apply_kl_penalty if available
+                        # 【步骤 7.2】应用 KL 惩罚（可选）
+                        # 【公式】r_modified = r_original - β * KL(π_θ || π_ref)
+                        # 【作用】约束策略不要偏离参考策略太远
+                        # 【配置项】algorithm.use_kl_in_reward=True 开启
+                        # 【注意】β 可以是固定值或自适应调整（KL Controller）
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
                         else:
+                            # 不使用 KL 惩罚时，token_level_rewards = token_level_scores
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # 【步骤 7.3】Rollout 修正（Off-Policy 处理）
+                        # 【适用场景】异步训练时，rollout 策略可能与当前策略不同
+                        # 使用 Importance Sampling 修正这种不一致
+                        # 【仅在 Decoupled 模式下运行】Bypass 模式下由 actor 在更新时计算
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            and not bypass_recomputing_logprobs  # 仅在 decoupled 模式
                         ):
                             from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
-                            # Compute IS weights, apply rejection sampling, compute metrics
+                            # 计算 IS 权重、应用拒绝采样、收集 metrics
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
-                        # compute advantages, executed on the driver process
+                        # 【步骤 7.4】计算 Advantage（核心算法在 driver 进程执行）
+                        # 【支持的估计器】
+                        # - GAE (Generalized Advantage Estimation): 使用 critic 的值函数
+                        #   A_t = Σ (γλ)^l δ_{t+l}, 其中 δ_t = r_t + γV(s_{t+1}) - V(s_t)
+                        #   【参数】gamma=折扣因子，lam=GAE的λ参数
+                        #
+                        # - GRPO (Group Relative Policy Optimization): 组内相对优势
+                        #   A_i = (R_i - mean(R_group)) / std(R_group)
+                        #   【优点】不需要 critic 网络，计算更简单
+                        #   【适用】同一 prompt 生成多个 response 的场景
+                        #
+                        # - REINFORCE++: 带 baseline 的 REINFORCE
+                        # - REMAX: 使用贪婪解码作为 baseline
+                        # - OPO: Optimal Policy Optimization
+                        #
+                        # 【配置项】algorithm.adv_estimator 选择使用的估计器
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        )  # GRPO 是否对 advantage 做标准差归一化
 
                         batch = compute_advantage(
                             batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            adv_estimator=self.config.algorithm.adv_estimator,  # 选择哪种优势估计器
+                            gamma=self.config.algorithm.gamma,   # 折扣因子，通常 0.99 或 1.0
+                            lam=self.config.algorithm.lam,       # GAE 的 λ 参数，通常 0.95
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,  # 每个 prompt 的响应数
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        # 【输出】batch 中添加了 "advantages" 和 "returns" 字段
 
-                    # update critic
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # 【阶段 8】模型更新（策略优化的核心）
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                    # 【步骤 8.1】更新 Critic 网络
+                    # 【目标函数】最小化值函数的 MSE 损失
+                    # L_critic = E[(V_θ(s) - R_target)²]
+                    # 其中 R_target = advantages + old_values (即 returns)
+                    # 【注意】Critic 更新在 Actor 之前，确保值函数尽可能准确
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
+                        # 合并并记录 critic 的训练 metrics（loss、grad_norm 等）
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
+                    # 【步骤 8.2】更新 Actor 网络（策略更新）
+                    # 【Critic Warmup 机制】
+                    # 前 N 步只训练 Critic，不更新 Actor
+                    # 【目的】让 Critic 先学习到一个合理的值函数估计
+                    # 避免用不准确的 advantage 指导 actor 更新
+                    # 【配置项】trainer.critic_warmup = N (默认为 0)
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # 【PPO 目标函数】
+                        # L_actor = -E[min(r(θ)·A, clip(r(θ), 1-ε, 1+ε)·A)]
+                        # 其中 r(θ) = π_θ(a|s) / π_old(a|s) 是 importance ratio
+                        # ε 是 clip 范围（通常 0.2）
+                        # 【核心思想】限制策略更新幅度，保证训练稳定性
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                        # 合并并记录 actor 的训练 metrics
+                        # 【关键 metrics】
+                        # - actor/loss: PPO loss
+                        # - actor/grad_norm: 梯度范数（监控训练稳定性）
+                        # - actor/clip_ratio: 被 clip 的 ratio 比例（过高说明更新过大）
+                        # - actor/approx_kl: 近似 KL 散度（与旧策略的差异）
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled
+                    # 【可选】保存 Rollout 数据用于调试或离线分析
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
-                # validate
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 【阶段 9】验证与模型评估
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 定期在验证集上评估模型性能
+                # 【触发条件】
+                # 1. val_reward_fn 不为 None（配置了验证奖励函数）
+                # 2. test_freq > 0（验证频率 > 0）
+                # 3. 当前步是最后一步 或 步数是 test_freq 的倍数
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.test_freq > 0
@@ -1619,35 +1834,52 @@ class RayPPOTrainer:
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
+                            # 保存最后一次验证结果用于最终输出
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
-                # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 【阶段 10】检查点保存（容错训练支持）
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 【ESI 检测】检查弹性服务器实例是否即将过期
+                # 云平台（如 Spot Instance）可能随时被回收
+                # 【策略】如果检测到即将过期，强制保存检查点
                 esi_close_to_expiration = should_save_ckpt_esi(
                     max_steps_duration=self.max_steps_duration,
                     redundant_time=self.config.trainer.esi_redundant_time,
                 )
-                # Check if the conditions for saving a checkpoint are met.
-                # The conditions include a mandatory condition (1) and
-                # one of the following optional conditions (2/3/4):
-                # 1. The save frequency is set to a positive value.
-                # 2. It's the last training step.
-                # 3. The current step number is a multiple of the save frequency.
-                # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                
+                # 【检查点保存条件】必须满足条件 1 + (2/3/4 之一)
+                # 1. save_freq > 0（开启了检查点保存功能）
+                # 2. is_last_step（训练结束时保存）
+                # 3. global_steps % save_freq == 0（按频率定期保存）
+                # 4. esi_close_to_expiration（实例即将过期，紧急保存）
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
                 ):
                     if esi_close_to_expiration:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        # 【检查点内容】
+                        # - Actor 模型权重和优化器状态
+                        # - Critic 模型权重和优化器状态
+                        # - global_steps（恢复训练进度）
+                        # - dataloader 状态（恢复数据位置）
                         self._save_checkpoint()
 
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 【阶段 11】性能分析收尾与状态更新
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 with marked_timer("stop_profile", timing_raw):
+                    # 更新 profiling 状态机
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
                         if self.config.global_profiler.steps is not None
                         else False
                     )
+                    # 决定是否停止 profiling
+                    # 连续模式：只在连续 profile 区间结束时停止
+                    # 非连续模式：每步结束都停止
                     self._stop_profiling(
                         curr_step_profile and not next_step_profile
                         if self.config.global_profiler.profile_continuous_steps
@@ -1656,37 +1888,55 @@ class RayPPOTrainer:
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
 
+                # 记录单步最大耗时（用于 ESI 保存策略判断）
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
-                # training metrics
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 【阶段 12】Metrics 收集与日志记录
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 【训练进度 metrics】
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
                     }
                 )
-                # collect metrics
+                
+                # 【数据 metrics】reward 统计、response 长度、KL 散度等
+                # 【重要监控指标】
+                # - reward/mean: 平均奖励，应该随训练上升
+                # - reward/std: 奖励标准差，过低可能意味着 reward hacking
+                # - response_length/mean: 平均响应长度
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                
+                # 【计时 metrics】各阶段耗时分布
+                # 用于识别训练瓶颈（生成 vs 奖励计算 vs 模型更新）
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
+                
+                # 【吞吐量 metrics】tokens/sec、samples/sec 等
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # compute variance proxy metrics
+                
+                # 【方差代理 metrics】梯度方差估计
+                # 【调试用途】高方差可能导致训练不稳定
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
-                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+                # 【注意】mismatch metrics（KL、PPL等）在 advantage 计算后已收集
 
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+                # 【课程学习采样器更新】（实验性功能）
+                # 根据当前 batch 的结果更新采样策略
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
-                # TODO: make a canonical logger that supports various backend
+                # 将所有 metrics 写入日志（wandb、tensorboard 等）
                 logger.log(data=metrics, step=self.global_steps)
 
+                # 更新进度条和步数计数
                 progress_bar.update(1)
                 self.global_steps += 1
 
+                # 【内存 Profiling】（可选）保存内存快照用于调试
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
@@ -1695,15 +1945,19 @@ class RayPPOTrainer:
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                     )
 
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 【阶段 13】训练结束处理
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 if is_last_step:
+                    # 确保所有异步操作完成
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    # 输出最终验证结果
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 
-                # this is experimental and may be changed/removed in the future
-                # in favor of a general-purpose data buffer pool
+                # 【数据集动态更新】（实验性功能）
+                # 某些数据集需要在每个 batch 后更新（如在线数据收集）
                 if hasattr(self.train_dataset, "on_batch_end"):
-                    # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)

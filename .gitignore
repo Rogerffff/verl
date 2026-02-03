@@ -121,6 +121,8 @@ ENV/
 
 # data
 *.parquet
+coding_model_project/data/raw/*_raw.jsonl
+coding_model_project/data/raw/*.bak.*
 
 
 # local logs

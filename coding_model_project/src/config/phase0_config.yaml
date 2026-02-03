@@ -1,0 +1,107 @@
+# Phase 0 基线评测配置
+# =====================
+
+# 模型配置
+model:
+  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  # 可选模型：
+  # - Qwen/Qwen2.5-Coder-7B-Instruct (推荐)
+  # - Qwen/Qwen2.5-Coder-14B-Instruct
+  # - deepseek-ai/deepseek-coder-7b-instruct-v1.5
+
+# vLLM 服务配置
+vllm:
+  url: "http://localhost:8000"
+  timeout: 300  # 请求超时（秒）
+
+  # 启动 vLLM 服务器命令参考：
+  # python -m vllm.entrypoints.openai.api_server \
+  #     --model ${model.name} \
+  #     --tensor-parallel-size 1 \
+  #     --port 8000 \
+  #     --trust-remote-code
+
+# SandboxFusion 配置
+sandbox:
+  url: "http://localhost:8080"
+  run_timeout: 10      # 代码执行超时（秒）
+  compile_timeout: 10  # 编译超时（秒）
+
+  # 启动 SandboxFusion 命令参考：
+  # cd /path/to/SandboxFusion && make run
+
+# 生成配置 (EVAL@1 协议)
+generation:
+  temperature: 0.0    # Greedy decoding
+  max_tokens: 2048    # 最大生成 token 数
+  n_samples: 1        # 每题生成样本数（EVAL@1 = 1）
+  # stop_tokens: []   # 可选停止符
+
+# 数据集配置
+datasets:
+  - humaneval        # HumanEval (164 题)
+  - mbpp_reg         # MBPP Regular ID 11-210 (200 题)
+  # - codecontests_train  # CodeContests 训练集
+  # - codecontests_valid  # CodeContests 验证集
+  # - codecontests_test   # CodeContests 测试集
+
+# 数据源配置
+data:
+  # 使用 manifest 文件加载数据（推荐，经过去重）
+  use_manifest: false
+  manifest_dir: "data/manifests"
+  raw_dir: "data/raw"
+
+  # 或直接从 SandboxFusion 获取
+  # use_manifest: false
+
+# 输出配置
+output:
+  dir: "outputs/phase0"
+
+  # 问答日志配置
+  save_qa_logs: true
+  qa_sample_size: 50  # 每个数据集保存的 QA 样本数
+
+# WandB 配置
+wandb:
+  enabled: false
+  project: "rlvr_coding_model"
+  entity: null  # WandB 用户名/团队名
+  run_name: null  # 自动生成：phase0_YYYYMMDD_HHMMSS
+  tags:
+    - phase0
+    - baseline
+
+# 并发配置
+concurrency:
+  max_inference_requests: 10  # 最大并发推理请求
+  max_judge_requests: 5       # 最大并发判题请求
+  batch_size: 20              # 每批处理的问题数
+
+# GPU 服务器配置建议
+# ===================
+# | GPU 数量 | tensor_parallel_size | 说明 |
+# |---------|---------------------|------|
+# | 1       | 1                   | 单卡运行 7B 模型 |
+# | 2       | 2                   | 7B 模型推荐配置 |
+# | 4       | 2                   | 可运行 2 个 replica |
+# | 8       | 2                   | 可运行 4 个 replica |
+
+# 启动命令示例
+# ============
+# 1. 启动 SandboxFusion:
+#    cd /path/to/SandboxFusion && make run
+#
+# 2. 启动 vLLM:
+#    python -m vllm.entrypoints.openai.api_server \
+#        --model Qwen/Qwen2.5-Coder-7B-Instruct \
+#        --tensor-parallel-size 1 \
+#        --port 8000
+#
+# 3. 运行评测:
+#    python src/phase0_eval.py \
+#        --vllm_url http://localhost:8000 \
+#        --sandbox_url http://localhost:8080 \
+#        --datasets humaneval mbpp_reg \
+#        --output_dir outputs/phase0
