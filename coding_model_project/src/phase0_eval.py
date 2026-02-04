@@ -58,6 +58,31 @@ import numpy as np  # 数值计算（用于统计）
 from utils.metrics import MetricsCollector, EvalResult
 from utils.qa_logger import QALogger
 
+# 评测配置常量（所有 Phase 共用）
+try:
+    from eval_config import (
+        EVAL_CONSTANTS,
+        DATASET_CONFIGS,
+        get_sampling_params,
+        get_sandbox_config,
+        get_concurrency_config,
+        print_config_summary,
+    )
+    EVAL_CONFIG_AVAILABLE = True
+except ImportError:
+    EVAL_CONFIG_AVAILABLE = False
+    # 回退默认值
+    EVAL_CONSTANTS = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_new_tokens": 2048,
+        "run_timeout": 30,
+        "memory_limit_mb": 1024,
+        "truncation_warning_threshold": 0.05,
+        "timeout_warning_threshold": 0.10,
+    }
+    print("Warning: eval_config not found, using fallback defaults")
+
 # =============================================================================
 # 可选依赖检测
 # =============================================================================
@@ -131,13 +156,15 @@ class EvalConfig:
     vllm_url: str = "http://localhost:8000"  # 已有 vLLM 服务器地址
 
     # === 解码参数（EVAL@1 协议：贪婪解码） ===
+    # 注意：这些默认值来自 eval_config.EVAL_CONSTANTS，确保所有 Phase 一致
     temperature: float = 0.0  # 0.0 = greedy decoding，确保可复现
     top_p: float = 1.0        # nucleus sampling 参数
     max_new_tokens: int = 2048  # 最大生成 token 数
 
     # === SandboxFusion 配置 ===
+    # 注意：run_timeout 从 10 秒改为 30 秒，适应 CodeContests 竞赛题
     sandbox_url: str = "http://localhost:8080"  # SandboxFusion 服务地址
-    run_timeout: int = 10     # 代码执行超时（秒）
+    run_timeout: int = 30     # 代码执行超时（秒）- CodeContests 需要更长时间
     memory_limit_mb: int = 1024  # 内存限制（MB）
 
     # === 评测方式选择 ===
@@ -1000,6 +1027,7 @@ def _evaluate_humaneval(
         code=full_code,
         language="python",
         run_timeout=config.run_timeout,
+        memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
     ))
 
     judge_time = time.time() - start_time
@@ -1085,6 +1113,7 @@ def _evaluate_mbpp(
         code=full_code,
         language="python",
         run_timeout=config.run_timeout,
+        memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
     ))
 
     judge_time = time.time() - start_time
@@ -1177,6 +1206,7 @@ def _evaluate_codecontests(
             code=code,
             language="python",
             run_timeout=config.run_timeout,
+            memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
             stdin=stdin_input,  # 传入标准输入
         ))
 
@@ -1410,6 +1440,8 @@ async def evaluate_dataset(
     total_gen_tokens = 0
     total_gen_time = 0.0
     total_judge_time = 0.0
+    truncation_count = 0  # 截断计数（finish_reason == "length"）
+    timeout_count = 0     # 超时计数
 
     # 记录开始时间（用于计算 throughput）
     dataset_start_time = time.time()
@@ -1455,8 +1487,13 @@ async def evaluate_dataset(
             # 累计生成指标
             gen_tokens = gen_meta.get("completion_tokens", 0)
             gen_time = gen_meta.get("gen_time", 0.0)
+            finish_reason = gen_meta.get("finish_reason", "unknown")
             total_gen_tokens += gen_tokens
             total_gen_time += gen_time
+
+            # 检查是否被截断（finish_reason == "length" 表示达到 max_tokens 上限）
+            if finish_reason == "length":
+                truncation_count += 1
 
             # 根据配置选择评测方式
             if test_cases and config.use_external_tests:
@@ -1480,6 +1517,10 @@ async def evaluate_dataset(
             eval_result.gen_time = gen_time
 
             total_judge_time += eval_result.judge_time
+
+            # 统计超时错误
+            if eval_result.error_type == "timeout":
+                timeout_count += 1
 
             # 记录到指标收集器
             metrics_collector.add_result(dataset_key, eval_result)
@@ -1520,6 +1561,10 @@ async def evaluate_dataset(
         cost_per_solved_tokens = float('inf')
         cost_per_solved_judge_time = float('inf')
 
+    # 计算截断率和超时率
+    truncation_rate = truncation_count / len(results) if results else 0.0
+    timeout_rate = timeout_count / len(results) if results else 0.0
+
     dataset_metrics = {
         "total_problems": len(results),
         # 质量指标
@@ -1538,6 +1583,11 @@ async def evaluate_dataset(
         "throughput": throughput,
         "cost_per_solved_tokens": cost_per_solved_tokens,
         "cost_per_solved_judge_time": cost_per_solved_judge_time,
+        # 质量控制指标
+        "truncation_count": truncation_count,
+        "truncation_rate": truncation_rate,
+        "timeout_count": timeout_count,
+        "timeout_rate": timeout_rate,
     }
 
     print(f"\n  Results for {dataset_key}:")
@@ -1545,6 +1595,20 @@ async def evaluate_dataset(
     print(f"    pass_ratio_mean: {dataset_metrics['pass_ratio_mean']:.4f}")
     print(f"    avg_gen_tokens: {dataset_metrics['avg_gen_tokens']:.1f}")
     print(f"    throughput: {throughput:.2f} problems/sec")
+    print(f"    truncation_rate: {truncation_rate:.2%} ({truncation_count}/{len(results)})")
+    print(f"    timeout_rate: {timeout_rate:.2%} ({timeout_count}/{len(results)})")
+
+    # 质量控制警告
+    truncation_threshold = EVAL_CONSTANTS.get("truncation_warning_threshold", 0.05)
+    timeout_threshold = EVAL_CONSTANTS.get("timeout_warning_threshold", 0.10)
+
+    if truncation_rate > truncation_threshold:
+        print(f"    ⚠️  WARNING: truncation_rate ({truncation_rate:.2%}) > {truncation_threshold:.0%}")
+        print(f"       Consider increasing max_new_tokens (current: {config.max_new_tokens})")
+
+    if timeout_rate > timeout_threshold:
+        print(f"    ⚠️  WARNING: timeout_rate ({timeout_rate:.2%}) > {timeout_threshold:.0%}")
+        print(f"       Consider increasing run_timeout (current: {config.run_timeout}s)")
 
     return dataset_metrics
 
