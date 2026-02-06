@@ -35,6 +35,7 @@ Phase 0 基线评测脚本 - 使用 verl 分布式推理架构
 import asyncio      # 异步编程，用于并发处理多个生成/评测请求
 import argparse     # 命令行参数解析
 import json         # JSON 读写
+import hashlib      # 哈希（用于 prompt 指纹，便于对齐分析）
 import os           # 操作系统接口
 import sys          # 系统功能（如 sys.exit()）
 import time         # 时间测量，用于计算生成/评测耗时
@@ -172,7 +173,13 @@ class EvalConfig:
     use_external_tests: bool = True  # 优先使用外部测试用例（从 raw 数据加载）
 
     # === 数据配置 ===
-    datasets: List[str] = field(default_factory=lambda: ["humaneval", "mbpp_reg"])
+    datasets: List[str] = field(default_factory=lambda: [
+        "humaneval",
+        "mbpp_reg",
+        "codecontests_valid_big",
+        "codecontests_valid",
+        "codecontests_test",
+    ])
     manifest_dir: Optional[str] = None  # Manifest 目录，使用去重后的数据
 
     # === 并发控制 ===
@@ -182,6 +189,16 @@ class EvalConfig:
     # === 输出配置 ===
     output_dir: str = "outputs/phase0"  # 结果输出目录
     qa_sample_size: int = 50            # 每个数据集保存的问答样本数
+    save_full_results: bool = True      # 是否保存全量 per-problem 结果（便于 badcase 分析）
+    max_response_chars: int = 12000     # per-problem 结果中 response 最大长度（防止单条过大）
+    max_prompt_chars: int = 4000        # per-problem 结果中 prompt 最大长度
+
+    # === 数据量控制（便于在大数据集上快速跑统计）===
+    max_problems: Optional[int] = None  # 每个数据集最多评测多少题（None=全量）
+    shuffle_seed: int = 0               # max_problems 生效时的 shuffle 种子（确保可复现）
+
+    # === 可选：评测前做轻量“格式修复”（默认关闭，避免影响 baseline 可比性）===
+    autofix_codecontests_entrypoint: bool = False  # CodeContests: def solve 存在但未调用时自动补 main guard
 
     # === WandB 配置 ===
     use_wandb: bool = False              # 是否启用 WandB 日志
@@ -277,6 +294,21 @@ Output ONLY:
 # python code
 </code>""",
 
+    "codecontests_valid_big": """Solve the following competitive programming problem in Python.
+
+Rules:
+- Read from stdin and write to stdout.
+- Your program MUST produce output when executed (call solve() under main guard, or execute at top-level).
+- Use fast I/O if needed (sys.stdin.buffer).
+- Do NOT print anything except the required output.
+
+{prompt}
+
+Output ONLY:
+<code>
+# python code
+</code>""",
+
     "codecontests_test": """Solve the following competitive programming problem in Python.
 
 Rules:
@@ -353,6 +385,10 @@ DATASET_SANDBOX_CONFIG = {
         "language": "python",
     },
     "codecontests_valid": {
+        "sandbox_dataset": "code_contests",
+        "language": "python",
+    },
+    "codecontests_valid_big": {
         "sandbox_dataset": "code_contests",
         "language": "python",
     },
@@ -922,6 +958,58 @@ def _parse_run_code_result(result) -> Tuple[str, str, str, Optional[int]]:
     return overall_status, output, run_status, return_code
 
 
+def _parse_run_code_result_detailed(result) -> Dict[str, Any]:
+    """
+    解析 SandboxFusion run_code API 的返回结果（更详细字段）。
+
+    说明：
+    - CodeContests 的正确输出应该只比较 stdout；stderr/message 只用于 debug
+    - 这里保留 compile/run 的 stdout/stderr 便于 badcase 定位
+    """
+    def _enum_to_value(value: Any) -> str:
+        if value is None:
+            return ""
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, str):
+            s = enum_value
+        else:
+            s = str(value)
+
+        if s.startswith("RunStatus."):
+            return s.split(".", 1)[1]
+        if s.startswith("CommandRunStatus."):
+            return s.split(".", 1)[1]
+
+        for token in ("Success", "Failed", "SandboxError", "Finished", "TimeLimitExceeded", "Error"):
+            if token in s:
+                return token
+        return s
+
+    overall_status = _enum_to_value(getattr(result, "status", "unknown")) or "unknown"
+    message = str(getattr(result, "message", "") or "")
+
+    compile_result = getattr(result, "compile_result", None)
+    compile_stdout = str(getattr(compile_result, "stdout", "") or "") if compile_result is not None else ""
+    compile_stderr = str(getattr(compile_result, "stderr", "") or "") if compile_result is not None else ""
+
+    run_result = getattr(result, "run_result", None)
+    run_status = _enum_to_value(getattr(run_result, "status", "")) if run_result is not None else ""
+    return_code = getattr(run_result, "return_code", None) if run_result is not None else None
+    run_stdout = str(getattr(run_result, "stdout", "") or "") if run_result is not None else ""
+    run_stderr = str(getattr(run_result, "stderr", "") or "") if run_result is not None else ""
+
+    return {
+        "overall_status": overall_status,
+        "message": message,
+        "compile_stdout": compile_stdout,
+        "compile_stderr": compile_stderr,
+        "run_status": run_status,
+        "return_code": return_code,
+        "run_stdout": run_stdout,
+        "run_stderr": run_stderr,
+    }
+
+
 def _extract_code_from_completion(completion: str) -> str:
     """
     从模型输出中提取代码
@@ -956,6 +1044,53 @@ def _extract_code_from_completion(completion: str) -> str:
 
     # 3. 返回原始内容
     return completion.strip()
+
+
+def _codecontests_autofix_entrypoint(code: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    CodeContests 轻量格式修复：
+    - 若定义了 solve() 但未调用，则自动追加 main guard 调用。
+
+    注意：默认不开启（见 config.autofix_codecontests_entrypoint），避免影响 baseline 可比性。
+    """
+    import re
+
+    info = {"applied": False, "reason": ""}
+
+    if not code or not code.strip():
+        info["reason"] = "empty_code"
+        return code, info
+
+    has_solve_def = re.search(r"\bdef\s+solve\s*\(", code) is not None
+    if not has_solve_def:
+        info["reason"] = "no_solve_def"
+        return code, info
+
+    has_main_guard = re.search(r"if\s+__name__\s*==\s*['\"]__main__['\"]\s*:", code) is not None
+    has_solve_call = re.search(r"^\s*solve\s*\(\s*\)\s*$", code, flags=re.MULTILINE) is not None
+
+    # 已经具备 main guard + solve() 调用：无需修复
+    if has_main_guard and has_solve_call:
+        info["reason"] = "already_has_main_guard_and_solve_call"
+        return code, info
+
+    # 顶层已调用 solve()（没有 main guard 也没问题）：避免重复追加
+    if has_solve_call and not has_main_guard:
+        info["reason"] = "already_calls_solve"
+        return code, info
+
+    fixed = code.rstrip() + "\n\nif __name__ == \"__main__\":\n    solve()\n"
+    info["applied"] = True
+    info["reason"] = "append_main_guard_solve_call"
+    return fixed, info
+
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
+
+def _normalize_ws(s: str) -> str:
+    return " ".join((s or "").split())
 
 
 def evaluate_with_run_code(
@@ -1253,11 +1388,23 @@ def _evaluate_codecontests(
 
     # 提取代码
     code = _extract_code_from_completion(completion)
+    autofix_info: Dict[str, Any] = {"enabled": False, "applied": False, "reason": ""}
+    if config.autofix_codecontests_entrypoint:
+        fixed, info = _codecontests_autofix_entrypoint(code)
+        autofix_info = {"enabled": True, **info}
+        code = fixed
 
     passed = 0
     total = len(tests)
     error_type = "success"
     last_error = ""
+    mismatch_summary: Dict[str, Any] = {
+        "mismatch_count": 0,
+        "first_mismatch": None,
+        "case_insensitive_match_count": 0,
+        "ws_insensitive_match_count": 0,
+        "case_ws_insensitive_match_count": 0,
+    }
 
     # 逐个执行测试用例
     for tc in tests:
@@ -1273,9 +1420,14 @@ def _evaluate_codecontests(
             stdin=stdin_input,  # 传入标准输入
         ))
 
-        # 使用辅助函数解析结果
-        overall_status, output, run_status, return_code = _parse_run_code_result(result)
-        actual_output = output.strip()
+        parsed = _parse_run_code_result_detailed(result)
+        overall_status = parsed["overall_status"]
+        run_status = parsed["run_status"]
+        return_code = parsed["return_code"]
+
+        # 对拍只比较 stdout（stderr/message 仅用于 debug）
+        actual_stdout = parsed.get("run_stdout") or ""
+        actual_output = actual_stdout.strip()
 
         # 判断是否通过：整体运行成功才进入 stdout 比较
         if overall_status == "Success" and (return_code in (0, None)):
@@ -1284,10 +1436,37 @@ def _evaluate_codecontests(
                 passed += 1
             else:
                 error_type = "wrong_answer"
-                last_error = f"Expected: {expected_output[:100]}, Got: {actual_output[:100]}"
-        elif "SyntaxError" in actual_output:
+                mismatch_summary["mismatch_count"] += 1
+
+                exp = expected_output
+                got = actual_output
+                if got.lower() == exp.lower() and got != exp:
+                    mismatch_summary["case_insensitive_match_count"] += 1
+                if _normalize_ws(got) == _normalize_ws(exp) and got != exp:
+                    mismatch_summary["ws_insensitive_match_count"] += 1
+                if _normalize_ws(got.lower()) == _normalize_ws(exp.lower()) and got != exp:
+                    mismatch_summary["case_ws_insensitive_match_count"] += 1
+
+                if mismatch_summary["first_mismatch"] is None:
+                    mismatch_summary["first_mismatch"] = {
+                        "stdin": stdin_input[:2000],
+                        "expected": expected_output[:2000],
+                        "got_stdout": actual_stdout[:2000],
+                        "got_stderr": (parsed.get("run_stderr") or "")[:2000],
+                    }
+
+                last_error = f"Expected: {expected_output[:200]}, Got: {actual_output[:200]}"
+        elif (
+            "SyntaxError" in actual_output
+            or "SyntaxError" in (parsed.get("compile_stderr") or "")
+            or "SyntaxError" in (parsed.get("run_stderr") or "")
+        ):
             error_type = "syntax_error"
-            last_error = actual_output[:200]
+            last_error = (
+                (parsed.get("compile_stderr") or "")
+                + (parsed.get("run_stderr") or "")
+                + (parsed.get("message") or "")
+            )[:500] or actual_output[:200]
             break  # 语法错误直接退出
         elif run_status == "TimeLimitExceeded" or "timelimitexceeded" in actual_output.lower():
             error_type = "timeout"
@@ -1295,7 +1474,11 @@ def _evaluate_codecontests(
             break
         else:
             error_type = "runtime_error"
-            last_error = actual_output[:200]
+            last_error = (
+                (parsed.get("compile_stderr") or "")
+                + (parsed.get("run_stderr") or "")
+                + (parsed.get("message") or "")
+            )[:500] or actual_output[:200]
 
     judge_time = time.time() - start_time
     pass_ratio = passed / total if total > 0 else 0.0
@@ -1303,6 +1486,16 @@ def _evaluate_codecontests(
 
     if accepted:
         error_type = "success"
+
+    format_match_type = "strict"
+    if (not accepted) and error_type == "wrong_answer" and mismatch_summary["mismatch_count"] > 0:
+        # 仅用于分析：指出可能的“输出格式”类 mismatch
+        if mismatch_summary["case_ws_insensitive_match_count"] > 0:
+            format_match_type = "case+ws_insensitive_possible"
+        elif mismatch_summary["ws_insensitive_match_count"] > 0:
+            format_match_type = "ws_insensitive_possible"
+        elif mismatch_summary["case_insensitive_match_count"] > 0:
+            format_match_type = "case_insensitive_possible"
 
     return EvalResult(
         problem_id=problem_id,
@@ -1314,6 +1507,9 @@ def _evaluate_codecontests(
             "passed": passed,
             "total": total,
             "last_error": last_error,
+            "format_match_type": format_match_type,
+            "mismatch_summary": mismatch_summary,
+            "autofix": autofix_info,
         },
     )
 
@@ -1492,6 +1688,15 @@ async def evaluate_dataset(
     print(f"Evaluating: {dataset_key} ({len(prompts)} problems)")
     print(f"{'='*60}")
 
+    # 大数据集可选：shuffle + 截断到 max_problems（保持可复现）
+    if config.max_problems is not None and len(prompts) > config.max_problems:
+        import random
+        rng = random.Random(config.shuffle_seed)
+        prompts = prompts[:]  # shallow copy
+        rng.shuffle(prompts)
+        prompts = prompts[: config.max_problems]
+        print(f"  NOTE: max_problems enabled -> evaluating {len(prompts)} problems (seed={config.shuffle_seed})")
+
     # 采样参数（EVAL@1 协议）
     sampling_params = {
         "temperature": config.temperature,
@@ -1505,6 +1710,15 @@ async def evaluate_dataset(
     total_judge_time = 0.0
     truncation_count = 0  # 截断计数（finish_reason == "length"）
     timeout_count = 0     # 超时计数
+
+    # 可选：保存全量 per-problem 结果（便于 badcase 分析）
+    per_problem_f = None
+    if config.save_full_results:
+        per_problem_dir = Path(config.output_dir) / "per_problem"
+        per_problem_dir.mkdir(parents=True, exist_ok=True)
+        per_problem_path = per_problem_dir / f"{dataset_key}.jsonl"
+        per_problem_f = open(per_problem_path, "w", encoding="utf-8")
+        print(f"  Writing per-problem logs to: {per_problem_path}")
 
     # 记录开始时间（用于计算 throughput）
     dataset_start_time = time.time()
@@ -1603,12 +1817,35 @@ async def evaluate_dataset(
                 gen_metadata=gen_meta,
             )
 
+            if per_problem_f is not None:
+                prompt_cut = (prompt or "")[: config.max_prompt_chars]
+                response_cut = (generated_code or "")[: config.max_response_chars]
+                per_problem_record = {
+                    "dataset": dataset_key,
+                    "problem_id": problem_id,
+                    "prompt_sha256": _sha256_text(prompt or ""),
+                    "prompt": prompt_cut,
+                    "response": response_cut,
+                    "accepted": eval_result.accepted,
+                    "pass_ratio": eval_result.pass_ratio,
+                    "error_type": eval_result.error_type,
+                    "judge_time": eval_result.judge_time,
+                    "gen_tokens": gen_tokens,
+                    "gen_time": gen_time,
+                    "finish_reason": finish_reason,
+                    "details": eval_result.details,
+                }
+                per_problem_f.write(json.dumps(per_problem_record, ensure_ascii=False) + "\n")
+
             results.append({
                 "problem_id": problem_id,
                 "accepted": eval_result.accepted,
                 "pass_ratio": eval_result.pass_ratio,
                 "error_type": eval_result.error_type,
             })
+
+    if per_problem_f is not None:
+        per_problem_f.close()
 
     # 计算 wall_clock_time 并设置到 metrics_collector
     wall_clock_time = time.time() - dataset_start_time
@@ -1941,7 +2178,7 @@ Examples:
 
     # === 数据集配置 ===
     parser.add_argument("--datasets", nargs="+", type=str,
-                        default=["humaneval", "mbpp_reg"],
+                        default=["humaneval", "mbpp_reg", "codecontests_valid_big", "codecontests_valid", "codecontests_test"],
                         help="要评测的数据集列表")
     parser.add_argument("--manifest_dir", type=str, default=None,
                         help="Manifest 目录（使用去重后的数据，包含测试用例）")
@@ -1951,6 +2188,16 @@ Examples:
                         help="输出目录")
     parser.add_argument("--qa_sample_size", type=int, default=50,
                         help="每个数据集保存的 QA 样本数")
+    parser.add_argument("--save_full_results", dest="save_full_results", action="store_true", default=True,
+                        help="保存全量 per-problem 结果到 output_dir/per_problem/（默认启用）")
+    parser.add_argument("--no_save_full_results", dest="save_full_results", action="store_false",
+                        help="不保存全量 per-problem 结果")
+    parser.add_argument("--max_problems", type=int, default=None,
+                        help="每个数据集最多评测多少题（用于大数据集快速跑统计）")
+    parser.add_argument("--shuffle_seed", type=int, default=0,
+                        help="max_problems 生效时的 shuffle 种子")
+    parser.add_argument("--autofix_codecontests_entrypoint", action="store_true", default=False,
+                        help="CodeContests: 若定义了 solve() 但未调用，自动追加 main guard 调用（默认关闭，避免影响 baseline 可比性）")
 
     # === WandB 配置 ===
     parser.add_argument("--use_wandb", action="store_true",
@@ -1985,6 +2232,10 @@ Examples:
         manifest_dir=args.manifest_dir,
         output_dir=args.output_dir,
         qa_sample_size=args.qa_sample_size,
+        save_full_results=args.save_full_results,
+        max_problems=args.max_problems,
+        shuffle_seed=args.shuffle_seed,
+        autofix_codecontests_entrypoint=args.autofix_codecontests_entrypoint,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         max_concurrent_requests=args.max_concurrent,

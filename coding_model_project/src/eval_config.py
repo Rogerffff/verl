@@ -81,6 +81,13 @@ DATASET_CONFIGS = {
         "typical_accepted_rate": (0.03, 0.12),
         "run_timeout": 30,
     },
+    "codecontests_valid_big": {
+        "sandbox_dataset": "code_contests",
+        "language": "python",
+        "expected_problems": 500,
+        "typical_accepted_rate": (0.03, 0.12),
+        "run_timeout": 30,
+    },
     "codecontests_test": {
         "sandbox_dataset": "code_contests",
         "language": "python",

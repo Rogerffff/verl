@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-02-06T19:42:13",
+  "inputs": {
+    "train_manifest": "coding_model_project/data/manifests/codecontests_train_manifest.jsonl",
+    "train_raw": "coding_model_project/data/raw/codecontests_train_raw.jsonl"
+  },
+  "outputs": {
+    "valid_big_manifest": "coding_model_project/data/manifests/codecontests_valid_big_manifest.jsonl",
+    "train_wo_valid_big_manifest": "coding_model_project/data/manifests/codecontests_train_wo_valid_big_manifest.jsonl",
+    "valid_big_raw": "coding_model_project/data/raw/codecontests_valid_big_raw.jsonl",
+    "train_wo_valid_big_raw": "coding_model_project/data/raw/codecontests_train_wo_valid_big_raw.jsonl"
+  },
+  "sampling": {
+    "prefix": "Codeforces/",
+    "seed": 42,
+    "requested_valid_big_size": 500,
+    "candidate_count": 6776,
+    "sampled_count": 500
+  },
+  "counts": {
+    "train_manifest_before": 12285,
+    "train_manifest_after": 11785,
+    "valid_big_manifest": 500,
+    "train_raw_before": 13328,
+    "train_raw_after": 12828,
+    "valid_big_raw": 500
+  },
+  "hashes": {
+    "sampled_problem_ids_sha256": "de93011a1dd431729b08a2d62b1e4a3efdfa75e160fc9de2144d13edf151d27c",
+    "sampled_prompt_sha256_sha256": "816634e4a1f1adb4be1eddda6f8932ed863ec1b96c98b0a67e38d635e46ccfd8"
+  },
+  "checks": {
+    "valid_big_manifest_count": 500,
+    "train_wo_manifest_count": 11785,
+    "valid_big_raw_count": 500,
+    "train_wo_raw_count": 12828,
+    "manifest_partition_disjoint": true,
+    "manifest_partition_complete": true,
+    "raw_partition_disjoint": true,
+    "raw_partition_complete": true,
+    "valid_big_manifest_all_prefix": true,
+    "valid_big_manifest_matches_sampled": true,
+    "valid_big_raw_matches_sampled": true,
+    "sampled_in_manifest": true,
+    "sampled_in_raw": true,
+    "requested_size_matched": true
+  }
+}
