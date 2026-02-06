@@ -39,6 +39,7 @@ import hashlib      # 哈希（用于 prompt 指纹，便于对齐分析）
 import os           # 操作系统接口
 import sys          # 系统功能（如 sys.exit()）
 import time         # 时间测量，用于计算生成/评测耗时
+from concurrent.futures import ThreadPoolExecutor  # 线程池，用于并发执行 sandbox 测试用例
 
 # dataclass: 自动生成数据类
 # field: 定义有默认值的可变字段
@@ -183,8 +184,9 @@ class EvalConfig:
     manifest_dir: Optional[str] = None  # Manifest 目录，使用去重后的数据
 
     # === 并发控制 ===
-    max_concurrent_requests: int = 64  # 最大并发请求数
+    max_concurrent_requests: int = 64  # 最大并发请求数（vLLM 生成）
     batch_size: int = 50               # 批处理大小
+    judge_concurrency: int = 20        # CodeContests 测试用例并发执行数（线程池大小）
 
     # === 输出配置 ===
     output_dir: str = "outputs/phase0"  # 结果输出目录
@@ -1367,12 +1369,14 @@ def _evaluate_codecontests(
         ]
     }
 
+    优化：使用 ThreadPoolExecutor 并发执行所有测试用例的 run_code 调用，
+    将原来的 O(N * avg_latency) 串行耗时降低为 O(avg_latency * ceil(N / concurrency))。
+
     评测步骤：
     1. 提取代码
-    2. 对每个测试用例：
-       - 执行代码，传入 stdin
-       - 比较实际输出与期望输出
-    3. 统计通过率
+    2. 构建所有测试用例的 RunCodeRequest
+    3. 使用线程池并发执行所有 run_code 调用
+    4. 汇总结果：统计通过率、错误类型
     """
     tests = test_cases.get("tests", [])
 
@@ -1394,9 +1398,34 @@ def _evaluate_codecontests(
         autofix_info = {"enabled": True, **info}
         code = fixed
 
-    passed = 0
     total = len(tests)
-    error_type = "success"
+
+    # ---- 构建所有 RunCodeRequest ----
+    requests = [
+        RunCodeRequest(
+            code=code,
+            language="python",
+            run_timeout=config.run_timeout,
+            memory_limit_MB=config.memory_limit_mb,
+            stdin=tc.get("input", ""),
+        )
+        for tc in tests
+    ]
+
+    # ---- 并发执行所有测试用例 ----
+    # 使用线程池并发调用同步 run_code()，每个线程独立发 HTTP 请求
+    def _safe_run_code(req):
+        """包装 run_code，捕获异常返回 None（避免单个失败导致整批崩溃）"""
+        try:
+            return run_code(req)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=config.judge_concurrency) as executor:
+        run_results = list(executor.map(_safe_run_code, requests))
+
+    # ---- 汇总结果 ----
+    passed = 0
     last_error = ""
     mismatch_summary: Dict[str, Any] = {
         "mismatch_count": 0,
@@ -1405,20 +1434,28 @@ def _evaluate_codecontests(
         "ws_insensitive_match_count": 0,
         "case_ws_insensitive_match_count": 0,
     }
+    # 收集每个测试用例的错误类型，最后按优先级确定整体错误类型
+    has_syntax_error = False
+    has_timeout = False
+    has_runtime_error = False
+    has_wrong_answer = False
+    # 记录每个测试用例的错误类型（用于详细分析）
+    test_case_errors: List[Dict[str, Any]] = []
 
-    # 逐个执行测试用例
-    for tc in tests:
-        stdin_input = tc.get("input", "")
+    for tc_idx, (tc, result) in enumerate(zip(tests, run_results)):
         expected_output = tc.get("output", "").strip()
+        stdin_input = tc.get("input", "")
 
-        # run_code 支持 stdin 参数
-        result = run_code(RunCodeRequest(
-            code=code,
-            language="python",
-            run_timeout=config.run_timeout,
-            memory_limit_MB=config.memory_limit_mb,  # 注意：SDK 字段名是大写 MB
-            stdin=stdin_input,  # 传入标准输入
-        ))
+        # 处理 sandbox 异常（run_code 调用失败返回 None）
+        if result is None:
+            has_runtime_error = True
+            last_error = "SandboxError: run_code call failed"
+            test_case_errors.append({
+                "test_index": tc_idx,
+                "error_type": "sandbox_error",
+                "error_message": "run_code call failed",
+            })
+            continue
 
         parsed = _parse_run_code_result_detailed(result)
         overall_status = parsed["overall_status"]
@@ -1434,8 +1471,13 @@ def _evaluate_codecontests(
             # 精确比较输出
             if actual_output == expected_output:
                 passed += 1
+                test_case_errors.append({
+                    "test_index": tc_idx,
+                    "error_type": "success",
+                    "error_message": "",
+                })
             else:
-                error_type = "wrong_answer"
+                has_wrong_answer = True
                 mismatch_summary["mismatch_count"] += 1
 
                 exp = expected_output
@@ -1456,46 +1498,85 @@ def _evaluate_codecontests(
                     }
 
                 last_error = f"Expected: {expected_output[:200]}, Got: {actual_output[:200]}"
+                test_case_errors.append({
+                    "test_index": tc_idx,
+                    "error_type": "wrong_answer",
+                    "error_message": last_error[:500],
+                    "expected": expected_output[:200],
+                    "got": actual_output[:200],
+                })
         elif (
             "SyntaxError" in actual_output
             or "SyntaxError" in (parsed.get("compile_stderr") or "")
             or "SyntaxError" in (parsed.get("run_stderr") or "")
         ):
-            error_type = "syntax_error"
-            last_error = (
+            has_syntax_error = True
+            error_msg = (
                 (parsed.get("compile_stderr") or "")
                 + (parsed.get("run_stderr") or "")
                 + (parsed.get("message") or "")
             )[:500] or actual_output[:200]
-            break  # 语法错误直接退出
+            last_error = error_msg
+            test_case_errors.append({
+                "test_index": tc_idx,
+                "error_type": "syntax_error",
+                "error_message": error_msg,
+            })
         elif run_status == "TimeLimitExceeded" or "timelimitexceeded" in actual_output.lower():
-            error_type = "timeout"
+            has_timeout = True
             last_error = "Execution timeout"
-            break
+            test_case_errors.append({
+                "test_index": tc_idx,
+                "error_type": "timeout",
+                "error_message": "Execution timeout",
+            })
         else:
-            error_type = "runtime_error"
-            last_error = (
+            has_runtime_error = True
+            error_msg = (
                 (parsed.get("compile_stderr") or "")
                 + (parsed.get("run_stderr") or "")
                 + (parsed.get("message") or "")
             )[:500] or actual_output[:200]
+            last_error = error_msg
+            test_case_errors.append({
+                "test_index": tc_idx,
+                "error_type": "runtime_error",
+                "error_message": error_msg,
+            })
 
     judge_time = time.time() - start_time
     pass_ratio = passed / total if total > 0 else 0.0
     accepted = (passed == total)
 
+    # 按优先级确定整体错误类型：syntax_error > timeout > runtime_error > wrong_answer
     if accepted:
         error_type = "success"
+    elif has_syntax_error:
+        error_type = "syntax_error"
+    elif has_timeout:
+        error_type = "timeout"
+    elif has_runtime_error:
+        error_type = "runtime_error"
+    elif has_wrong_answer:
+        error_type = "wrong_answer"
+    else:
+        error_type = "wrong_answer"
 
     format_match_type = "strict"
     if (not accepted) and error_type == "wrong_answer" and mismatch_summary["mismatch_count"] > 0:
-        # 仅用于分析：指出可能的“输出格式”类 mismatch
+        # 仅用于分析：指出可能的"输出格式"类 mismatch
         if mismatch_summary["case_ws_insensitive_match_count"] > 0:
             format_match_type = "case+ws_insensitive_possible"
         elif mismatch_summary["ws_insensitive_match_count"] > 0:
             format_match_type = "ws_insensitive_possible"
         elif mismatch_summary["case_insensitive_match_count"] > 0:
             format_match_type = "case_insensitive_possible"
+
+    # 统计各错误类型的数量（用于分析）
+    error_type_counts = {}
+    for tc_err in test_case_errors:
+        err_type = tc_err["error_type"]
+        error_type_counts[err_type] = error_type_counts.get(err_type, 0) + 1
 
     return EvalResult(
         problem_id=problem_id,
@@ -1510,6 +1591,8 @@ def _evaluate_codecontests(
             "format_match_type": format_match_type,
             "mismatch_summary": mismatch_summary,
             "autofix": autofix_info,
+            "test_case_errors": test_case_errors,  # 每个测试用例的详细错误信息
+            "error_type_counts": error_type_counts,  # 各错误类型的统计（便于快速查看）
         },
     )
 
@@ -2207,9 +2290,11 @@ Examples:
 
     # === 并发配置 ===
     parser.add_argument("--max_concurrent", type=int, default=64,
-                        help="最大并发请求数")
+                        help="最大并发请求数（vLLM 生成阶段）")
     parser.add_argument("--batch_size", type=int, default=50,
                         help="批处理大小")
+    parser.add_argument("--judge_concurrency", type=int, default=20,
+                        help="CodeContests 测试用例并发执行线程数（默认 20）")
 
     args = parser.parse_args()
 
@@ -2240,6 +2325,7 @@ Examples:
         wandb_project=args.wandb_project,
         max_concurrent_requests=args.max_concurrent,
         batch_size=args.batch_size,
+        judge_concurrency=args.judge_concurrency,
     )
 
     # 检查模式兼容性
