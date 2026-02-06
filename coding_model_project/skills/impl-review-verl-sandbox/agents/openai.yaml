@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implementation Review (verl+sandbox)"
+  short_description: "Review implementation against phase plans and APIs."
+  default_prompt: "Review implemented code against the phase plan, verify verl and SandboxFusion API/field correctness, and report requirement traceability gaps with fixes."

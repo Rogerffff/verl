@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Review (verl+sandbox)"
+  short_description: "Strictly review implementation plans for verl/SandboxFusion."
+  default_prompt: "Review this implementation plan (not high-level design), verify all verl and SandboxFusion API/command/path claims against repository code, then output risks and fixes with file evidence."

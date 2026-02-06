@@ -1,10 +1,15 @@
 # verl 代码库快速导航
-/Users/xiaohui/Desktop/verl 下有两个独立的 git 仓库
-verl/ 和 SandboxFusion/ 注意当前所在的目录位置
-
 
 verl (Volcano Engine Reinforcement Learning for LLMs) 是大型语言模型强化学习训练框架，支持 PPO、GRPO、DAPO 等算法，基于 Hybrid-Controller 编程模型。
 
+## 跨仓库路径提示（重要）
+
+- 当前主工作仓库路径：`/Users/xiaohui/Desktop/verl/verl`
+- SandboxFusion 仓库路径：`/Users/xiaohui/Desktop/verl/SandboxFusion`
+- 当任务涉及 SandboxFusion 的 API、执行逻辑、返回字段、文档或实现细节时，必须到 `SandboxFusion` 仓库下查证，不要只在 `verl` 仓库内检索。
+
+/Users/xiaohui/Desktop/verl 下有两个独立的 git 仓库
+verl/ 和 SandboxFusion/ 注意当前所在的目录位置
 ---
 
 ## 顶层目录
