@@ -159,8 +159,9 @@ class MetricsCollector:
         pass_ratio_p50 = float(np.median(pass_ratios))
         pass_ratio_p90 = float(np.percentile(pass_ratios, 90))
 
-        # 可执行率：代码能运行（不是语法错误、不是超时、不是 API 错误）
-        executable_types = {"success", "wrong_answer", "runtime_error"}
+        # 可执行率：代码能“跑完”（不要求正确），用于衡量格式/运行稳定性
+        # 约定：wrong_answer 表示输出不正确但程序完成执行；runtime_error/timeout/syntax_error 不计入可执行
+        executable_types = {"success", "wrong_answer"}
         exec_count = sum(1 for r in results if r.error_type in executable_types)
         exec_success_rate = exec_count / total
 

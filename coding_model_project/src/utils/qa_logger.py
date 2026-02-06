@@ -125,9 +125,8 @@ class QALogger:
         对单个数据集进行分层抽样
 
         抽样策略：
-        1. 保留所有失败案例（如果数量不超过 sample_size）
-        2. 每种错误类型至少保留 min_per_error_type 个
-        3. 剩余配额从成功案例中随机抽样
+        1. 每种失败错误类型至少保留 min_per_error_type 个（如不足则全量）
+        2. 在剩余配额内优先补足失败样本，其次补足成功样本，直到达到 sample_size
 
         Args:
             dataset: 数据集名称
@@ -138,37 +137,58 @@ class QALogger:
         entries_by_type = self._entries[dataset]
         all_types = list(entries_by_type.keys())
 
-        sampled = []
-        remaining_quota = self.sample_size
+        sampled: List[QALogEntry] = []
+        sampled_problem_ids = set()
 
-        # 1. 优先保留失败案例
+        # 1) 覆盖每种失败错误类型
         failure_types = [t for t in all_types if t != "success"]
 
         for error_type in failure_types:
             type_entries = entries_by_type[error_type]
+            if not type_entries:
+                continue
 
-            # 计算应该保留的数量
-            keep_count = min(
-                len(type_entries),
-                max(self.min_per_error_type, remaining_quota // max(1, len(failure_types)))
-            )
+            keep_count = min(len(type_entries), self.min_per_error_type)
+            chosen = type_entries if len(type_entries) <= keep_count else random.sample(type_entries, keep_count)
+            for entry in chosen:
+                if entry.problem_id in sampled_problem_ids:
+                    continue
+                sampled.append(entry)
+                sampled_problem_ids.add(entry.problem_id)
 
-            # 如果数量不超过配额，全部保留；否则随机抽样
-            if len(type_entries) <= keep_count:
-                sampled.extend(type_entries)
-            else:
-                sampled.extend(random.sample(type_entries, keep_count))
-
-            remaining_quota -= len(sampled) - (len(sampled) - min(len(type_entries), keep_count))
-
-        # 2. 剩余配额从成功案例中抽样
+        # 2) 罕见成功样本：如果成功样本本身很少，优先全量保留（便于 case study）
         success_entries = entries_by_type.get("success", [])
-        if success_entries and remaining_quota > 0:
-            keep_count = min(len(success_entries), remaining_quota)
-            if len(success_entries) <= keep_count:
-                sampled.extend(success_entries)
-            else:
-                sampled.extend(random.sample(success_entries, keep_count))
+        if 0 < len(success_entries) <= self.min_per_error_type:
+            for entry in success_entries:
+                if len(sampled) >= self.sample_size:
+                    break
+                if entry.problem_id in sampled_problem_ids:
+                    continue
+                sampled.append(entry)
+                sampled_problem_ids.add(entry.problem_id)
+
+        # 3) 补足到 sample_size：优先失败，其次成功
+        remaining_quota = max(0, self.sample_size - len(sampled))
+        if remaining_quota == 0:
+            return sampled
+
+        remaining_failures: List[QALogEntry] = []
+        for error_type in failure_types:
+            for entry in entries_by_type.get(error_type, []):
+                if entry.problem_id not in sampled_problem_ids:
+                    remaining_failures.append(entry)
+
+        remaining_successes = [
+            entry for entry in entries_by_type.get("success", [])
+            if entry.problem_id not in sampled_problem_ids
+        ]
+
+        remaining_pool = remaining_failures + remaining_successes
+        if not remaining_pool:
+            return sampled
+
+        keep_count = min(len(remaining_pool), remaining_quota)
+        sampled.extend(remaining_pool if len(remaining_pool) <= keep_count else random.sample(remaining_pool, keep_count))
 
         return sampled
 

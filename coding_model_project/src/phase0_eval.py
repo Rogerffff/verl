@@ -598,6 +598,42 @@ async def batch_generate(
 
 
 # =============================================================================
+# vLLM / OpenAI API 运行信息（可审计）
+# =============================================================================
+
+async def fetch_openai_models(server_addresses: List[str], timeout_s: float = 10.0) -> Dict[str, Any]:
+    """
+    通过 OpenAI-compatible API 查询服务端实际暴露的 model id 列表。
+
+    用途：
+    - 防止“评测脚本传了某个 model 名，但 vLLM 实际跑的是另一个模型”导致 baseline 失真
+    - 将结果落盘到 outputs，便于复现与审计
+    """
+    results: Dict[str, Any] = {}
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for addr in server_addresses:
+            url = f"http://{addr}/v1/models"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        results[addr] = {"error": f"HTTP {resp.status}: {text[:500]}"}
+                        continue
+                    data = await resp.json()
+                    model_ids = []
+                    for item in data.get("data", []) if isinstance(data, dict) else []:
+                        if isinstance(item, dict) and "id" in item:
+                            model_ids.append(item["id"])
+                    results[addr] = {"model_ids": model_ids}
+            except Exception as e:
+                results[addr] = {"error": str(e)}
+
+    return results
+
+
+# =============================================================================
 # 代码评测（SandboxFusion）
 # =============================================================================
 
@@ -828,7 +864,7 @@ def _determine_error_type_from_metadata(metadata_list) -> str:
     return "wrong_answer"
 
 
-def _parse_run_code_result(result) -> Tuple[str, str]:
+def _parse_run_code_result(result) -> Tuple[str, str, str, Optional[int]]:
     """
     解析 SandboxFusion run_code API 的返回结果
 
@@ -840,31 +876,50 @@ def _parse_run_code_result(result) -> Tuple[str, str]:
       - stderr: 标准错误字符串
 
     Returns:
-        (status_str, output_str)
-        - status_str: 状态字符串（如 "Success", "Finished"）
-        - output_str: 输出内容（stdout + stderr）
+        (overall_status, output_str, run_status, return_code)
+        - overall_status: RunStatus（Success/Failed/SandboxError 等，来自 result.status）
+        - output_str: 输出内容（compile+run 的 stdout+stderr + message）
+        - run_status: CommandRunStatus（Finished/TimeLimitExceeded/Error 等，来自 result.run_result.status）
+        - return_code: 进程返回码（来自 result.run_result.return_code）
     """
-    # 获取顶层状态（枚举转字符串）
-    status = str(getattr(result, 'status', 'unknown'))
+    def _enum_to_value(value: Any) -> str:
+        if value is None:
+            return ""
+        # Enum(str, Enum) usually exposes .value = "Success"/"Failed"/...
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, str):
+            s = enum_value
+        else:
+            s = str(value)
 
-    # 获取 run_result 对象
-    run_result = getattr(result, 'run_result', None)
+        # Normalize common Enum string representations: "RunStatus.Success" -> "Success"
+        if s.startswith("RunStatus."):
+            return s.split(".", 1)[1]
+        if s.startswith("CommandRunStatus."):
+            return s.split(".", 1)[1]
 
-    if run_result is not None and hasattr(run_result, 'stdout'):
-        # run_result 是结构化对象
-        stdout = run_result.stdout or ""
-        stderr = run_result.stderr or ""
-        output = stdout + stderr
+        # Some environments may stringify enums as "<RunStatus.Success: 'Success'>"
+        for token in ("Success", "Failed", "SandboxError", "Finished", "TimeLimitExceeded", "Error"):
+            if token in s:
+                return token
 
-        # 也检查内部状态
-        inner_status = str(getattr(run_result, 'status', ''))
-        if "Finished" in inner_status:
-            status = "Finished"
-    else:
-        # 回退：直接转字符串
-        output = str(run_result) if run_result else ""
+        return s
 
-    return status, output
+    overall_status = _enum_to_value(getattr(result, "status", "unknown")) or "unknown"
+    message = str(getattr(result, "message", "") or "")
+
+    compile_result = getattr(result, "compile_result", None)
+    compile_stdout = str(getattr(compile_result, "stdout", "") or "") if compile_result is not None else ""
+    compile_stderr = str(getattr(compile_result, "stderr", "") or "") if compile_result is not None else ""
+
+    run_result = getattr(result, "run_result", None)
+    run_status = _enum_to_value(getattr(run_result, "status", "")) if run_result is not None else ""
+    return_code = getattr(run_result, "return_code", None) if run_result is not None else None
+    run_stdout = str(getattr(run_result, "stdout", "") or "") if run_result is not None else ""
+    run_stderr = str(getattr(run_result, "stderr", "") or "") if run_result is not None else ""
+
+    output = "".join([compile_stdout, compile_stderr, run_stdout, run_stderr, message])
+    return overall_status, output, run_status, return_code
 
 
 def _extract_code_from_completion(completion: str) -> str:
@@ -1033,18 +1088,20 @@ def _evaluate_humaneval(
     judge_time = time.time() - start_time
 
     # 使用辅助函数解析结果
-    status, output = _parse_run_code_result(result)
+    overall_status, output, run_status, return_code = _parse_run_code_result(result)
 
-    # 判断是否通过（检查 Success 或 Finished）
-    accepted = "Success" in status or "Finished" in status
+    # 判断是否通过（以 SandboxFusion 顶层 RunStatus 为准；不要用 CommandRunStatus.Finished）
+    accepted = (overall_status == "Success") and (return_code in (0, None))
 
     # 确定错误类型
     if accepted:
         error_type = "success"
+    elif run_status == "TimeLimitExceeded" or "timelimitexceeded" in output.lower():
+        error_type = "timeout"
     elif "SyntaxError" in output:
         error_type = "syntax_error"
-    elif "timeout" in status.lower() or "timeout" in output.lower():
-        error_type = "timeout"
+    elif "AssertionError" in output:
+        error_type = "wrong_answer"
     elif "Error" in output:
         error_type = "runtime_error"
     else:
@@ -1057,7 +1114,9 @@ def _evaluate_humaneval(
         error_type=error_type,
         judge_time=judge_time,
         details={
-            "status": status,
+            "status": overall_status,
+            "run_status": run_status,
+            "return_code": return_code,
             "output": output[:500],  # 截取前 500 字符
         },
     )
@@ -1119,17 +1178,19 @@ def _evaluate_mbpp(
     judge_time = time.time() - start_time
 
     # 使用辅助函数解析结果
-    status, output = _parse_run_code_result(result)
+    overall_status, output, run_status, return_code = _parse_run_code_result(result)
 
-    # 判断是否通过（检查 Success 或 Finished）
-    accepted = "Success" in status or "Finished" in status
+    # 判断是否通过（以 SandboxFusion 顶层 RunStatus 为准）
+    accepted = (overall_status == "Success") and (return_code in (0, None))
 
     if accepted:
         error_type = "success"
+    elif run_status == "TimeLimitExceeded" or "timelimitexceeded" in output.lower():
+        error_type = "timeout"
+    elif "AssertionError" in output:
+        error_type = "wrong_answer"
     elif "SyntaxError" in output:
         error_type = "syntax_error"
-    elif "timeout" in status.lower():
-        error_type = "timeout"
     elif "Error" in output:
         error_type = "runtime_error"
     else:
@@ -1142,7 +1203,9 @@ def _evaluate_mbpp(
         error_type=error_type,
         judge_time=judge_time,
         details={
-            "status": status,
+            "status": overall_status,
+            "run_status": run_status,
+            "return_code": return_code,
             "output": output[:500],
             "test_count": len(test_list),
         },
@@ -1211,11 +1274,11 @@ def _evaluate_codecontests(
         ))
 
         # 使用辅助函数解析结果
-        status, output = _parse_run_code_result(result)
+        overall_status, output, run_status, return_code = _parse_run_code_result(result)
         actual_output = output.strip()
 
-        # 判断是否通过（检查 Success 或 Finished）
-        if "Success" in status or "Finished" in status:
+        # 判断是否通过：整体运行成功才进入 stdout 比较
+        if overall_status == "Success" and (return_code in (0, None)):
             # 精确比较输出
             if actual_output == expected_output:
                 passed += 1
@@ -1226,7 +1289,7 @@ def _evaluate_codecontests(
             error_type = "syntax_error"
             last_error = actual_output[:200]
             break  # 语法错误直接退出
-        elif "timeout" in status.lower():
+        elif run_status == "TimeLimitExceeded" or "timelimitexceeded" in actual_output.lower():
             error_type = "timeout"
             last_error = "Execution timeout"
             break
@@ -1507,9 +1570,14 @@ async def evaluate_dataset(
                     generated_code, sandbox_dataset, problem_id, config
                 )
             else:
-                # 回退到 submit API
-                eval_result = evaluate_with_submit_api(
-                    generated_code, sandbox_dataset, problem_id, config
+                # 配置错误：既不使用外部测试，也不使用 submit API
+                eval_result = EvalResult(
+                    problem_id=problem_id,
+                    accepted=False,
+                    pass_ratio=0.0,
+                    error_type="api_error",
+                    judge_time=0.0,
+                    details={"error": "No evaluator enabled (use_external_tests=False and use_submit_api=False)"},
                 )
 
             # 补充 gen_tokens 和 gen_time 到 eval_result
@@ -1644,9 +1712,45 @@ async def run_evaluation(config: EvalConfig):
     else:
         # 简化模式：连接已有的 vLLM 服务器
         print(f"\n[Simple Mode] Connecting to {config.vllm_url}")
-        # 去掉 http:// 前缀
-        server_addresses = [config.vllm_url.replace("http://", "")]
+        # 规范化地址：支持 http(s)://host:port 以及直接 host:port
+        from urllib.parse import urlparse
+
+        parsed = urlparse(config.vllm_url)
+        if parsed.scheme:
+            server_addr = parsed.netloc or parsed.path
+        else:
+            server_addr = config.vllm_url
+        server_addresses = [server_addr.rstrip("/")]
         rollout_servers = None
+
+    # 记录可审计的 run 信息（配置 + 服务端 models）
+    run_info: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "argv": sys.argv,
+        "config": asdict(config),
+        "eval_constants": EVAL_CONSTANTS,
+        "server_addresses": server_addresses,
+        "python": sys.version,
+    }
+
+    try:
+        server_models = await fetch_openai_models(server_addresses)
+        run_info["openai_models"] = server_models
+
+        # 额外提示：请求的 model_path 不在服务端 /v1/models 中
+        served_ids = set()
+        for info in server_models.values():
+            for mid in info.get("model_ids", []) if isinstance(info, dict) else []:
+                served_ids.add(mid)
+        if served_ids and config.model_path not in served_ids:
+            print(f"Warning: requested model '{config.model_path}' not in /v1/models: {sorted(served_ids)[:5]}")
+    except Exception as e:
+        # 不阻塞评测，仅记录
+        run_info["openai_models_error"] = str(e)
+
+    with open(output_dir / "run_info.json", "w", encoding="utf-8") as f:
+        json.dump(run_info, f, indent=2, ensure_ascii=False)
+    print(f"Run info saved to: {output_dir / 'run_info.json'}")
 
     # 初始化组件
     metrics_collector = MetricsCollector()
@@ -1816,7 +1920,7 @@ Examples:
     # === SandboxFusion 配置 ===
     parser.add_argument("--sandbox_url", type=str, default="http://localhost:8080",
                         help="SandboxFusion 服务地址")
-    parser.add_argument("--run_timeout", type=int, default=10,
+    parser.add_argument("--run_timeout", type=int, default=EVAL_CONSTANTS.get("run_timeout", 30),
                         help="代码执行超时（秒）")
 
     # === 生成配置 ===
@@ -1826,10 +1930,14 @@ Examples:
                         help="最大生成 token 数")
 
     # === 评测方式 ===
-    parser.add_argument("--use_external_tests", action="store_true", default=True,
-                        help="使用外部测试用例（从 raw 数据加载）")
-    parser.add_argument("--use_submit_api", action="store_true",
-                        help="使用 SandboxFusion submit API（依赖内置数据）")
+    parser.add_argument("--use_external_tests", dest="use_external_tests", action="store_true", default=True,
+                        help="使用外部测试用例（从 raw 数据加载，默认启用）")
+    parser.add_argument("--no_external_tests", dest="use_external_tests", action="store_false",
+                        help="禁用外部测试用例（回退到 submit API）")
+    parser.add_argument("--use_submit_api", dest="use_submit_api", action="store_true", default=True,
+                        help="使用 SandboxFusion submit API（依赖内置数据，默认启用）")
+    parser.add_argument("--no_submit_api", dest="use_submit_api", action="store_false",
+                        help="禁用 submit API（需要外部测试用例，否则无法评测）")
 
     # === 数据集配置 ===
     parser.add_argument("--datasets", nargs="+", type=str,

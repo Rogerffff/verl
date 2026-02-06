@@ -28,7 +28,7 @@
 
 | 参数 | 命令行 | 默认值 | 说明 |
 |------|--------|--------|------|
-| `run_timeout` | `--run_timeout` | `30` | 代码执行超时（秒）。CodeContests 需要更长时间 |
+| `run_timeout` | `--run_timeout` | `30` | 代码执行超时（秒）。CodeContests 需要更长时间（脚本默认已对齐 eval_config.py） |
 | `memory_limit_mb` | - | `1024` | 内存限制（MB）。代码中默认值，无命令行参数 |
 
 ### 1.3 质量控制阈值
@@ -85,8 +85,10 @@
 
 | 参数 | 命令行 | 默认值 | 说明 |
 |------|--------|--------|------|
-| `use_external_tests` | `--use_external_tests` | `True` | 优先使用外部测试用例（从 raw 数据加载） |
-| `use_submit_api` | `--use_submit_api` | `True` | 使用 SandboxFusion submit API |
+| `use_external_tests` | `--use_external_tests` / `--no_external_tests` | `True` | 是否优先使用外部测试用例（从 raw 数据加载；建议配合 `--manifest_dir`） |
+| `use_submit_api` | `--use_submit_api` / `--no_submit_api` | `True` | 是否允许回退到 SandboxFusion submit API（依赖服务内置数据） |
+
+> 注意：如果同时关闭 `use_external_tests` 与 `use_submit_api`，脚本将无法评测并会记录 `api_error`。
 
 ---
 
@@ -160,6 +162,11 @@ python src/phase0_eval.py \
 |------|------|----------|
 | `truncation_rate` | 截断率（finish_reason="length"） | >5% |
 | `timeout_rate` | 超时率（error_type="timeout"） | >10% |
+
+### 5.4 可审计 Run 信息（新增）
+
+输出目录会额外生成：
+- `run_info.json`：包含本次运行的 `config`、`EVAL_CONSTANTS`、`server_addresses`、以及通过 OpenAI-compatible API 查询到的 `/v1/models` 列表（用于确认评测时实际服务的模型 ID）。
 
 ---
 

@@ -28,7 +28,7 @@ cd "$PROJECT_DIR"
 MODEL_NAME="Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # 服务地址
-VLLM_URL="http://localhost:8000"
+VLLM_URL="http://localhost:8001"
 SANDBOX_URL="http://localhost:8080"
 
 # 解码参数（EVAL@1 协议）
