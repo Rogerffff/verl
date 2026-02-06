@@ -1217,7 +1217,7 @@ def _evaluate_humaneval(
         code=full_code,
         language="python",
         run_timeout=config.run_timeout,
-        memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
+        memory_limit_MB=config.memory_limit_mb,  # 注意：SDK 字段名是大写 MB
     ))
 
     judge_time = time.time() - start_time
@@ -1307,7 +1307,7 @@ def _evaluate_mbpp(
         code=full_code,
         language="python",
         run_timeout=config.run_timeout,
-        memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
+        memory_limit_MB=config.memory_limit_mb,  # 注意：SDK 字段名是大写 MB
     ))
 
     judge_time = time.time() - start_time
@@ -1416,7 +1416,7 @@ def _evaluate_codecontests(
             code=code,
             language="python",
             run_timeout=config.run_timeout,
-            memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
+            memory_limit_MB=config.memory_limit_mb,  # 注意：SDK 字段名是大写 MB
             stdin=stdin_input,  # 传入标准输入
         ))
 

@@ -44,7 +44,7 @@ MAX_CONCURRENT=32
 BATCH_SIZE=50
 
 # 数据集
-DATASETS="humaneval mbpp_reg codecontests_valid"
+#DATASETS="humaneval mbpp_reg codecontests_valid"
 
 # 输出目录
 OUTPUT_DIR="outputs/phase0_$(date +%Y%m%d_%H%M%S)"
@@ -105,7 +105,6 @@ python src/phase0_eval.py \
     --vllm_url "$VLLM_URL" \
     --sandbox_url "$SANDBOX_URL" \
     $MANIFEST_ARG \
-    --datasets $DATASETS \
     --temperature $TEMPERATURE \
     --max_tokens $MAX_TOKENS \
     --run_timeout $RUN_TIMEOUT \
