@@ -751,8 +751,10 @@ class FSDPSFTTrainer:
             step_loss /= self.device_mesh.size(0)
         return {
             "train/loss": step_loss.detach().item(),
+            "train/lr": lr,
             "train/lr(1e-3)": lr * 1e3,
             "train/time(s)": spend_time_per_step,
+            "train/grad_norm": grad_norm.detach().item() if torch.isfinite(grad_norm) else float('nan'),
         }
 
     def validation_step(self, batch: TensorDict):
