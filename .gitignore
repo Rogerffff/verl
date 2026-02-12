@@ -123,6 +123,7 @@ ENV/
 *.parquet
 coding_model_project/data/raw/*_raw.jsonl
 coding_model_project/data/raw/*.bak.*
+coding_model_project/phase_1_ SFT/bee_hq_python_deduped_filtered/
 
 
 # local logs

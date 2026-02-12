@@ -161,6 +161,4 @@ python src/phase0_eval.py \
 If you're new to this project, read these files in order:
 
 1. `experiment_design/final_experiment_design.md` - Complete design
-2. `agent.md` - Project overview and file structure
-3. `phase_0_ Baseline/phase0_implementation_plan.md` - Implementation details
-4. `src/phase0_eval.py` - Core evaluation code
+

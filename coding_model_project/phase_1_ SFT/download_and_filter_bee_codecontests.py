@@ -18,7 +18,7 @@ from typing import Dict, Iterable, Optional, Set, Tuple
 from datasets import load_dataset
 
 
-CF_NAME_PATTERN = re.compile(r"(\\d+)_([A-Za-z0-9]+)")
+CF_NAME_PATTERN = re.compile(r"(\d+)_([A-Za-z0-9]+)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,12 +176,12 @@ def filter_split(
                 dropped += 1
                 overlap_file.write(
                     json.dumps({"name": overlap_name, "source": record.get("source")})
-                    + "\\n"
+                    + "\n"
                 )
             else:
                 if record_source(record) == 2 and not extract_cf_name(record.get("name")):
                     missing_name += 1
-                output_file.write(json.dumps(record, ensure_ascii=False) + "\\n")
+                output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 kept += 1
 
             if max_records and total >= max_records:

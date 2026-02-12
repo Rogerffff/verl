@@ -47,7 +47,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime   # 时间戳生成
 from pathlib import Path        # 路径操作
 from typing import Dict, List, Optional, Tuple, Any  # 类型提示
-from collections import defaultdict  # 默认值字典
+from collections import defaultdict, Counter  # 默认值字典
 
 # =============================================================================
 # 第三方库导入
@@ -111,9 +111,17 @@ try:
         TestConfig,           # 测试配置（语言、超时等）
         set_endpoint as set_sandbox_endpoint,  # 设置服务地址
     )
+    try:
+        from sandbox_fusion.async_client import run_code as run_code_async
+        SANDBOX_ASYNC_AVAILABLE = True
+    except Exception:
+        run_code_async = None
+        SANDBOX_ASYNC_AVAILABLE = False
     SANDBOX_AVAILABLE = True
 except ImportError:
     SANDBOX_AVAILABLE = False
+    SANDBOX_ASYNC_AVAILABLE = False
+    run_code_async = None
     print("Warning: sandbox_fusion not installed. Run: pip install sandbox-fusion")
 
 # verl compute_score：与 GRPO 训练一致的评测函数
@@ -183,7 +191,9 @@ class EvalConfig:
     manifest_dir: Optional[str] = None  # Manifest 目录，使用去重后的数据
 
     # === 并发控制 ===
-    max_concurrent_requests: int = 64  # 最大并发请求数
+    max_concurrent_requests: int = 64  # 生成阶段最大并发请求数
+    max_concurrent_judges: int = 16    # 判题阶段最大并发数
+    max_concurrent_testcases: int = 64  # 测试点级并发（全局限流）
     batch_size: int = 50               # 批处理大小
 
     # === 输出配置 ===
@@ -1514,6 +1524,265 @@ def _evaluate_codecontests(
     )
 
 
+def _truncate_text(text: str, limit: int) -> str:
+    """截断文本，避免日志过大。"""
+    return (text or "")[:limit]
+
+
+def _pick_primary_error(error_counts: Dict[str, int]) -> str:
+    """
+    根据测试点错误分布聚合题目级 error_type。
+
+    规则：
+    1. 先看出现次数（最多者）
+    2. 次数相同按优先级打破平局
+    """
+    if not error_counts:
+        return "success"
+
+    priority = {
+        "syntax_error": 6,
+        "runtime_error": 5,
+        "timeout": 4,
+        "wrong_answer": 3,
+        "api_error": 2,
+        "unknown": 1,
+    }
+    return max(error_counts.items(), key=lambda kv: (kv[1], priority.get(kv[0], 0)))[0]
+
+
+def _build_last_error_from_case(case: Optional[Dict[str, Any]]) -> str:
+    """将单个测试点失败结果转成题目级 last_error 文本。"""
+    if not case:
+        return ""
+
+    status = case.get("status", "unknown")
+    if status == "wrong_answer":
+        exp = case.get("expected", "")
+        got = case.get("actual", "")
+        return f"Expected: {exp[:200]}, Got: {got[:200]}"
+    if status == "timeout":
+        return "Execution timeout"
+    if status == "syntax_error":
+        return case.get("stderr", "")[:500] or "SyntaxError"
+    if status == "runtime_error":
+        return (case.get("stderr", "") + case.get("message", ""))[:500] or "RuntimeError"
+    if status == "api_error":
+        return case.get("error", "")[:500] or "APIError"
+    return status
+
+
+async def _run_codecontests_testcase_async(
+    code: str,
+    tc: Dict[str, Any],
+    test_idx: int,
+    config: EvalConfig,
+    testcase_semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    """
+    异步执行单个 CodeContests 测试点并返回结构化结果。
+    """
+    stdin_input = tc.get("input", "")
+    expected_output = tc.get("output", "").strip()
+
+    async with testcase_semaphore:
+        try:
+            client_timeout = max(60.0, float(config.run_timeout) * 2 + 5.0)
+            result = await run_code_async(
+                RunCodeRequest(
+                    code=code,
+                    language="python",
+                    run_timeout=config.run_timeout,
+                    memory_limit_mb=config.memory_limit_mb,
+                    stdin=stdin_input,
+                ),
+                endpoint=config.sandbox_url,
+                client_timeout=client_timeout,
+            )
+        except Exception as e:
+            return {
+                "test_idx": test_idx,
+                "status": "api_error",
+                "error": _truncate_text(str(e), 500),
+                "stdin": _truncate_text(stdin_input, 300),
+            }
+
+    parsed = _parse_run_code_result_detailed(result)
+    overall_status = parsed["overall_status"]
+    run_status = parsed["run_status"]
+    return_code = parsed["return_code"]
+    run_stdout = parsed.get("run_stdout") or ""
+    run_stderr = parsed.get("run_stderr") or ""
+    compile_stderr = parsed.get("compile_stderr") or ""
+    message = parsed.get("message") or ""
+    actual_output = run_stdout.strip()
+
+    case_result: Dict[str, Any] = {
+        "test_idx": test_idx,
+        "overall_status": overall_status,
+        "run_status": run_status,
+        "return_code": return_code,
+        "stdin": _truncate_text(stdin_input, 300),
+    }
+
+    if overall_status == "Success" and (return_code in (0, None)):
+        if actual_output == expected_output:
+            case_result["status"] = "success"
+            return case_result
+
+        case_insensitive_match = actual_output.lower() == expected_output.lower() and actual_output != expected_output
+        ws_insensitive_match = _normalize_ws(actual_output) == _normalize_ws(expected_output) and actual_output != expected_output
+        case_ws_insensitive_match = (
+            _normalize_ws(actual_output.lower()) == _normalize_ws(expected_output.lower())
+            and actual_output != expected_output
+        )
+        case_result.update({
+            "status": "wrong_answer",
+            "expected": _truncate_text(expected_output, 500),
+            "actual": _truncate_text(actual_output, 500),
+            "stderr": _truncate_text(run_stderr, 500),
+            "case_insensitive_match": case_insensitive_match,
+            "ws_insensitive_match": ws_insensitive_match,
+            "case_ws_insensitive_match": case_ws_insensitive_match,
+        })
+        return case_result
+
+    if (
+        "SyntaxError" in actual_output
+        or "SyntaxError" in compile_stderr
+        or "SyntaxError" in run_stderr
+    ):
+        case_result.update({
+            "status": "syntax_error",
+            "stderr": _truncate_text(compile_stderr + run_stderr, 500),
+            "message": _truncate_text(message, 300),
+        })
+        return case_result
+
+    if run_status == "TimeLimitExceeded" or "timelimitexceeded" in actual_output.lower():
+        case_result.update({
+            "status": "timeout",
+            "stderr": _truncate_text(run_stderr, 300),
+        })
+        return case_result
+
+    case_result.update({
+        "status": "runtime_error",
+        "stderr": _truncate_text(compile_stderr + run_stderr, 500),
+        "message": _truncate_text(message, 300),
+    })
+    return case_result
+
+
+async def _evaluate_codecontests_async(
+    completion: str,
+    test_cases: Dict[str, Any],
+    problem_id: str,
+    config: EvalConfig,
+    testcase_semaphore: asyncio.Semaphore,
+) -> EvalResult:
+    """
+    异步并发评测 CodeContests（测试点级并发）。
+    """
+    start_time = time.time()
+    tests = test_cases.get("tests", [])
+    if not tests:
+        return EvalResult(
+            problem_id=problem_id,
+            accepted=False,
+            pass_ratio=0.0,
+            error_type="no_test_cases",
+            judge_time=time.time() - start_time,
+            details={"error": "No test cases available"},
+        )
+
+    code = _extract_code_from_completion(completion)
+    autofix_info: Dict[str, Any] = {"enabled": False, "applied": False, "reason": ""}
+    if config.autofix_codecontests_entrypoint:
+        fixed, info = _codecontests_autofix_entrypoint(code)
+        autofix_info = {"enabled": True, **info}
+        code = fixed
+
+    tasks = [
+        _run_codecontests_testcase_async(
+            code=code,
+            tc=tc,
+            test_idx=i,
+            config=config,
+            testcase_semaphore=testcase_semaphore,
+        )
+        for i, tc in enumerate(tests)
+    ]
+    test_case_results = await asyncio.gather(*tasks)
+    test_case_results.sort(key=lambda x: x.get("test_idx", -1))
+
+    total = len(test_case_results)
+    passed = sum(1 for r in test_case_results if r.get("status") == "success")
+    pass_ratio = passed / total if total > 0 else 0.0
+    accepted = (passed == total)
+
+    error_counts = Counter(r.get("status", "unknown") for r in test_case_results if r.get("status") != "success")
+    error_type = "success" if accepted else _pick_primary_error(dict(error_counts))
+
+    first_failure = next((r for r in test_case_results if r.get("status") != "success"), None)
+    last_failure = next((r for r in reversed(test_case_results) if r.get("status") != "success"), None)
+    last_error = _build_last_error_from_case(last_failure)
+
+    mismatch_summary: Dict[str, Any] = {
+        "mismatch_count": 0,
+        "first_mismatch": None,
+        "case_insensitive_match_count": 0,
+        "ws_insensitive_match_count": 0,
+        "case_ws_insensitive_match_count": 0,
+    }
+    for case in test_case_results:
+        if case.get("status") != "wrong_answer":
+            continue
+        mismatch_summary["mismatch_count"] += 1
+        if case.get("case_insensitive_match"):
+            mismatch_summary["case_insensitive_match_count"] += 1
+        if case.get("ws_insensitive_match"):
+            mismatch_summary["ws_insensitive_match_count"] += 1
+        if case.get("case_ws_insensitive_match"):
+            mismatch_summary["case_ws_insensitive_match_count"] += 1
+        if mismatch_summary["first_mismatch"] is None:
+            mismatch_summary["first_mismatch"] = {
+                "stdin": case.get("stdin", ""),
+                "expected": case.get("expected", ""),
+                "got_stdout": case.get("actual", ""),
+                "got_stderr": case.get("stderr", ""),
+                "test_idx": case.get("test_idx", -1),
+            }
+
+    format_match_type = "strict"
+    if (not accepted) and mismatch_summary["mismatch_count"] > 0:
+        if mismatch_summary["case_ws_insensitive_match_count"] > 0:
+            format_match_type = "case+ws_insensitive_possible"
+        elif mismatch_summary["ws_insensitive_match_count"] > 0:
+            format_match_type = "ws_insensitive_possible"
+        elif mismatch_summary["case_insensitive_match_count"] > 0:
+            format_match_type = "case_insensitive_possible"
+
+    return EvalResult(
+        problem_id=problem_id,
+        accepted=accepted,
+        pass_ratio=pass_ratio,
+        error_type=error_type,
+        judge_time=time.time() - start_time,
+        details={
+            "passed": passed,
+            "total": total,
+            "last_error": last_error,
+            "first_failure": first_failure,
+            "error_type_counts": dict(error_counts),
+            "format_match_type": format_match_type,
+            "mismatch_summary": mismatch_summary,
+            "autofix": autofix_info,
+            "test_case_results": test_case_results,
+        },
+    )
+
+
 # =============================================================================
 # 数据加载
 # =============================================================================
@@ -1651,6 +1920,71 @@ def _load_from_manifest(dataset_key: str, manifest_dir: str) -> List[Dict[str, A
     return result
 
 
+async def evaluate_single_problem_async(
+    generated_code: str,
+    batch_item: Dict[str, Any],
+    config: EvalConfig,
+    judge_semaphore: asyncio.Semaphore,
+    testcase_semaphore: asyncio.Semaphore,
+) -> EvalResult:
+    """
+    异步评测单题。
+
+    说明：
+    - codecontests + 外部测试：走测试点级异步并发
+    - 其他路径：沿用阻塞 SDK，使用 asyncio.to_thread 包装
+    """
+    problem_id = batch_item["problem_id"]
+    sandbox_dataset = batch_item["sandbox_dataset"]
+    test_cases = batch_item.get("test_cases")
+
+    async with judge_semaphore:
+        try:
+            if test_cases and config.use_external_tests:
+                test_type = test_cases.get("type", "unknown")
+                if test_type == "codecontests" and SANDBOX_ASYNC_AVAILABLE and run_code_async is not None:
+                    return await _evaluate_codecontests_async(
+                        completion=generated_code,
+                        test_cases=test_cases,
+                        problem_id=problem_id,
+                        config=config,
+                        testcase_semaphore=testcase_semaphore,
+                    )
+                return await asyncio.to_thread(
+                    evaluate_with_run_code,
+                    generated_code,
+                    test_cases,
+                    problem_id,
+                    config,
+                )
+            if config.use_submit_api:
+                return await asyncio.to_thread(
+                    evaluate_with_submit_api,
+                    generated_code,
+                    sandbox_dataset,
+                    problem_id,
+                    config,
+                )
+
+            return EvalResult(
+                problem_id=problem_id,
+                accepted=False,
+                pass_ratio=0.0,
+                error_type="api_error",
+                judge_time=0.0,
+                details={"error": "No evaluator enabled (use_external_tests=False and use_submit_api=False)"},
+            )
+        except Exception as e:
+            return EvalResult(
+                problem_id=problem_id,
+                accepted=False,
+                pass_ratio=0.0,
+                error_type="api_error",
+                judge_time=0.0,
+                details={"error": f"judge_task_error: {e}"},
+            )
+
+
 # =============================================================================
 # 主评测流程
 # =============================================================================
@@ -1669,7 +2003,7 @@ async def evaluate_dataset(
     流程：
     1. 分批处理（避免内存溢出）
     2. 批量生成代码（并发请求多个 vLLM replica）
-    3. 逐个判题（评测通常是同步的）
+    3. 异步并发判题（题目级 + 测试点级限流）
     4. 收集指标和日志
     5. 返回数据集级别的统计信息
 
@@ -1722,6 +2056,8 @@ async def evaluate_dataset(
 
     # 记录开始时间（用于计算 throughput）
     dataset_start_time = time.time()
+    judge_semaphore = asyncio.Semaphore(max(1, config.max_concurrent_judges))
+    testcase_semaphore = asyncio.Semaphore(max(1, config.max_concurrent_testcases))
 
     # 分批处理
     for batch_start in range(0, len(prompts), config.batch_size):
@@ -1754,12 +2090,12 @@ async def evaluate_dataset(
             system_prompt=SYSTEM_PROMPT,  # 使用系统 prompt
         )
 
-        # 2. 逐个判题
+        # 2. 异步并发判题（受 Semaphore 限流）
+        batch_records = []
+        judge_tasks = []
         for i, (generated_code, gen_meta) in enumerate(gen_results):
             problem_id = batch[i]["problem_id"]
             prompt = batch[i]["prompt"]
-            sandbox_dataset = batch[i]["sandbox_dataset"]
-            test_cases = batch[i].get("test_cases")  # 可能为 None
 
             # 累计生成指标
             gen_tokens = gen_meta.get("completion_tokens", 0)
@@ -1772,27 +2108,36 @@ async def evaluate_dataset(
             if finish_reason == "length":
                 truncation_count += 1
 
-            # 根据配置选择评测方式
-            if test_cases and config.use_external_tests:
-                # 优先使用外部测试用例 + run_code API
-                eval_result = evaluate_with_run_code(
-                    generated_code, test_cases, problem_id, config
+            batch_records.append({
+                "problem_id": problem_id,
+                "prompt": prompt,
+                "generated_code": generated_code,
+                "gen_meta": gen_meta,
+                "gen_tokens": gen_tokens,
+                "gen_time": gen_time,
+                "finish_reason": finish_reason,
+            })
+            judge_tasks.append(
+                evaluate_single_problem_async(
+                    generated_code=generated_code,
+                    batch_item=batch[i],
+                    config=config,
+                    judge_semaphore=judge_semaphore,
+                    testcase_semaphore=testcase_semaphore,
                 )
-            elif config.use_submit_api:
-                # 使用 submit API（依赖 SandboxFusion 内置数据）
-                eval_result = evaluate_with_submit_api(
-                    generated_code, sandbox_dataset, problem_id, config
-                )
-            else:
-                # 配置错误：既不使用外部测试，也不使用 submit API
-                eval_result = EvalResult(
-                    problem_id=problem_id,
-                    accepted=False,
-                    pass_ratio=0.0,
-                    error_type="api_error",
-                    judge_time=0.0,
-                    details={"error": "No evaluator enabled (use_external_tests=False and use_submit_api=False)"},
-                )
+            )
+
+        batch_eval_results = await asyncio.gather(*judge_tasks)
+
+        # 3. 汇总判题结果并记录日志
+        for record, eval_result in zip(batch_records, batch_eval_results):
+            problem_id = record["problem_id"]
+            prompt = record["prompt"]
+            generated_code = record["generated_code"]
+            gen_meta = record["gen_meta"]
+            gen_tokens = record["gen_tokens"]
+            gen_time = record["gen_time"]
+            finish_reason = record["finish_reason"]
 
             # 补充 gen_tokens 和 gen_time 到 eval_result
             eval_result.gen_tokens = gen_tokens
@@ -2207,7 +2552,11 @@ Examples:
 
     # === 并发配置 ===
     parser.add_argument("--max_concurrent", type=int, default=64,
-                        help="最大并发请求数")
+                        help="生成阶段最大并发请求数")
+    parser.add_argument("--max_concurrent_judges", type=int, default=16,
+                        help="判题阶段最大并发数（异步并发执行 Sandbox 评测）")
+    parser.add_argument("--max_concurrent_testcases", type=int, default=64,
+                        help="测试点级并发上限（全局限流，适用于 codecontests 外部测试）")
     parser.add_argument("--batch_size", type=int, default=50,
                         help="批处理大小")
 
@@ -2239,6 +2588,8 @@ Examples:
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         max_concurrent_requests=args.max_concurrent,
+        max_concurrent_judges=args.max_concurrent_judges,
+        max_concurrent_testcases=args.max_concurrent_testcases,
         batch_size=args.batch_size,
     )
 
