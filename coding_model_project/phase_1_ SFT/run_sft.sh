@@ -54,7 +54,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC_PER_NODE} \
     data.max_length=4096 \
     data.truncation=right \
     data.train_batch_size=16 \
-    data.micro_batch_size_per_gpu=2 \
+    data.micro_batch_size_per_gpu=1 \
     data.balance_dp_token=True \
     model.partial_pretrain=Qwen/Qwen2.5-Coder-7B-Instruct \
     model.trust_remote_code=true \

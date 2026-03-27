@@ -1227,7 +1227,7 @@ def _evaluate_humaneval(
         code=full_code,
         language="python",
         run_timeout=config.run_timeout,
-        memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
+        memory_limit_MB=config.memory_limit_mb,  # 添加内存限制
     ))
 
     judge_time = time.time() - start_time
@@ -1317,7 +1317,7 @@ def _evaluate_mbpp(
         code=full_code,
         language="python",
         run_timeout=config.run_timeout,
-        memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
+        memory_limit_MB=config.memory_limit_mb,  # 添加内存限制
     ))
 
     judge_time = time.time() - start_time
@@ -1426,7 +1426,7 @@ def _evaluate_codecontests(
             code=code,
             language="python",
             run_timeout=config.run_timeout,
-            memory_limit_mb=config.memory_limit_mb,  # 添加内存限制
+            memory_limit_MB=config.memory_limit_mb,  # 添加内存限制
             stdin=stdin_input,  # 传入标准输入
         ))
 
@@ -1593,7 +1593,7 @@ async def _run_codecontests_testcase_async(
                     code=code,
                     language="python",
                     run_timeout=config.run_timeout,
-                    memory_limit_mb=config.memory_limit_mb,
+                    memory_limit_MB=config.memory_limit_mb,
                     stdin=stdin_input,
                 ),
                 endpoint=config.sandbox_url,
