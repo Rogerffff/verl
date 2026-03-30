@@ -10,6 +10,8 @@ SANDBOX_URL=${SANDBOX_URL:-http://localhost:8080}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-Coder-7B-Instruct}
 REWARD_MODE=${REWARD_MODE:-dense_pass_ratio}
 LIMITER_BUDGET=${LIMITER_BUDGET:-8}
+ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -34,8 +36,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=4 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM_UTIL \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     reward_manager.source=register \
