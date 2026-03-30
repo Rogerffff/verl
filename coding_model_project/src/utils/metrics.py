@@ -57,6 +57,7 @@ class DatasetMetrics:
     timeout_rate: float
     wrong_answer_rate: float
     api_error_rate: float
+    sandbox_error_rate: float
     unknown_error_rate: float
 
     # 成本指标
@@ -136,6 +137,7 @@ class MetricsCollector:
                 timeout_rate=0.0,
                 wrong_answer_rate=0.0,
                 api_error_rate=0.0,
+                sandbox_error_rate=0.0,
                 unknown_error_rate=0.0,
                 avg_judge_time=0.0,
                 total_judge_time=0.0,
@@ -172,7 +174,18 @@ class MetricsCollector:
         timeout_rate = error_counts.get("timeout", 0) / total
         wrong_answer_rate = error_counts.get("wrong_answer", 0) / total
         api_error_rate = error_counts.get("api_error", 0) / total
-        unknown_error_rate = error_counts.get("unknown", 0) / total
+        sandbox_error_rate = error_counts.get("sandbox_error", 0) / total
+        known_error_types = {
+            "success",
+            "syntax_error",
+            "runtime_error",
+            "timeout",
+            "wrong_answer",
+            "api_error",
+            "sandbox_error",
+        }
+        unknown_error_count = sum(count for err, count in error_counts.items() if err not in known_error_types)
+        unknown_error_rate = unknown_error_count / total
 
         # 成本指标 - 判题时间
         judge_times = np.array([r.judge_time for r in results])
@@ -210,6 +223,7 @@ class MetricsCollector:
             timeout_rate=timeout_rate,
             wrong_answer_rate=wrong_answer_rate,
             api_error_rate=api_error_rate,
+            sandbox_error_rate=sandbox_error_rate,
             unknown_error_rate=unknown_error_rate,
             avg_judge_time=avg_judge_time,
             total_judge_time=total_judge_time,
@@ -283,6 +297,7 @@ class MetricsCollector:
             metrics[f"{prefix}/{dataset}/timeout_rate"] = dm.timeout_rate
             metrics[f"{prefix}/{dataset}/wrong_answer_rate"] = dm.wrong_answer_rate
             metrics[f"{prefix}/{dataset}/api_error_rate"] = dm.api_error_rate
+            metrics[f"{prefix}/{dataset}/sandbox_error_rate"] = dm.sandbox_error_rate
             # 成本指标
             metrics[f"{prefix}/{dataset}/avg_judge_time"] = dm.avg_judge_time
             metrics[f"{prefix}/{dataset}/p50_judge_time"] = dm.p50_judge_time

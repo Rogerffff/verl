@@ -47,6 +47,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_verifier_metrics,
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
@@ -1909,6 +1910,7 @@ class RayPPOTrainer:
                 # - reward/std: 奖励标准差，过低可能意味着 reward hacking
                 # - response_length/mean: 平均响应长度
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_verifier_metrics(batch=batch))
                 
                 # 【计时 metrics】各阶段耗时分布
                 # 用于识别训练瓶颈（生成 vs 奖励计算 vs 模型更新）

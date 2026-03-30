@@ -58,6 +58,14 @@ import numpy as np  # 数值计算（用于统计）
 # 本地模块：指标收集和问答日志
 from utils.metrics import MetricsCollector, EvalResult
 from utils.qa_logger import QALogger
+try:
+    from coding_model_project.src.prompting import SYSTEM_PROMPT, format_prompt
+except ImportError:
+    from prompting import SYSTEM_PROMPT, format_prompt
+try:
+    from coding_model_project.src.verifier import normalize_candidate, verify_candidate
+except ImportError:
+    from verifier import normalize_candidate, verify_candidate
 
 # 评测配置常量（所有 Phase 共用）
 try:
@@ -102,13 +110,9 @@ except ImportError:
 try:
     from sandbox_fusion import (
         get_prompts,          # 获取数据集题目列表
-        submit,               # 提交代码评测（使用内置数据）
-        submit_safe,          # submit 的安全版本（自动处理异常）
         run_code,             # 执行代码（使用外部测试用例）
         GetPromptsRequest,    # get_prompts 的请求参数
-        SubmitRequest,        # submit 的请求参数
         RunCodeRequest,       # run_code 的请求参数
-        TestConfig,           # 测试配置（语言、超时等）
         set_endpoint as set_sandbox_endpoint,  # 设置服务地址
     )
     try:
@@ -124,13 +128,8 @@ except ImportError:
     run_code_async = None
     print("Warning: sandbox_fusion not installed. Run: pip install sandbox-fusion")
 
-# verl compute_score：与 GRPO 训练一致的评测函数
-try:
-    from verl.utils.reward_score.sandbox_fusion import compute_score
-    VERL_COMPUTE_SCORE_AVAILABLE = True
-except ImportError:
-    VERL_COMPUTE_SCORE_AVAILABLE = False
-
+# The shared verifier path intentionally does not route through verl's default code reward helpers.
+VERL_COMPUTE_SCORE_AVAILABLE = False
 
 # =============================================================================
 # 配置类
@@ -177,8 +176,8 @@ class EvalConfig:
     memory_limit_mb: int = 1024  # 内存限制（MB）
 
     # === 评测方式选择 ===
-    use_submit_api: bool = True      # 使用 submit() API（依赖 SandboxFusion 内置数据）
-    use_external_tests: bool = True  # 优先使用外部测试用例（从 raw 数据加载）
+    use_submit_api: bool = False     # 已弃用：shared truth 只使用 external tests
+    use_external_tests: bool = True  # 主判题路径：使用项目数据自带测试用例
 
     # === 数据配置 ===
     datasets: List[str] = field(default_factory=lambda: [
@@ -193,7 +192,7 @@ class EvalConfig:
     # === 并发控制 ===
     max_concurrent_requests: int = 64  # 生成阶段最大并发请求数
     max_concurrent_judges: int = 16    # 判题阶段最大并发数
-    max_concurrent_testcases: int = 64  # 测试点级并发（全局限流）
+    verifier_limiter_budget: int = 8    # shared verifier 的全局 sandbox 并发预算
     batch_size: int = 50               # 批处理大小
 
     # === 输出配置 ===
@@ -219,160 +218,6 @@ class EvalConfig:
 # =============================================================================
 # Prompt 模板配置
 # =============================================================================
-
-# System Prompt：指导模型生成 Python 代码
-# 注意：去掉了 solve() 示例，避免对 HumanEval/MBPP 的输出产生偏置
-SYSTEM_PROMPT = """You are an expert Python programmer.
-
-Output rules:
-1. Output Python code only.
-2. Include necessary imports only if needed.
-3. Wrap the entire code in <code> and </code>.
-4. Do not write anything outside the <code> tags.
-5. Follow dataset-specific constraints given by the user prompt (function-only vs full program)."""
-
-# 针对不同数据集的 User Prompt 模板
-# 注意：
-# - HumanEval/MBPP：要求输出完整函数定义，禁止 stdin/main guard
-# - MBPP：包含 {entry_point} 占位符，需要在 format_prompt 中替换
-# - CodeContests：强调代码执行时必须有输出
-PROMPT_TEMPLATES = {
-    # HumanEval：补全函数（输出完整函数定义）
-    "humaneval": """Complete the following Python function.
-
-Rules:
-- Keep the function name, parameters, and docstring unchanged.
-- Output a complete, executable Python code snippet that defines the function.
-- Use only Python standard library (no pip packages).
-- Do NOT read from stdin and do NOT print anything.
-- Do NOT include "if __name__ == '__main__':" or any top-level execution.
-- Do NOT define a function named "check" (it is reserved for tests).
-
-{prompt}
-
-Output ONLY:
-<code>
-# python code
-</code>""",
-
-    # MBPP：实现函数（必须指定函数名和调用形式）
-    "mbpp_reg": """Implement a Python function for the following task.
-
-Task:
-{prompt}
-
-Rules:
-- The function name MUST be: {entry_point}
-- Your function will be called like: {example_call}
-- Use only Python standard library (no pip packages).
-- Do NOT read from stdin and do NOT print anything.
-- Do NOT include "if __name__ == '__main__':" or any top-level execution.
-
-Output ONLY:
-<code>
-# python code
-</code>""",
-
-    # CodeContests：竞赛题（强调代码执行时必须有输出）
-    "codecontests_train": """Solve the following competitive programming problem in Python.
-
-Rules:
-- Read from stdin and write to stdout.
-- Your program MUST produce output when executed (call solve() under main guard, or execute at top-level).
-- Use fast I/O if needed (sys.stdin.buffer).
-- Do NOT print anything except the required output.
-
-{prompt}
-
-Output ONLY:
-<code>
-# python code
-</code>""",
-
-    "codecontests_valid": """Solve the following competitive programming problem in Python.
-
-Rules:
-- Read from stdin and write to stdout.
-- Your program MUST produce output when executed (call solve() under main guard, or execute at top-level).
-- Use fast I/O if needed (sys.stdin.buffer).
-- Do NOT print anything except the required output.
-
-{prompt}
-
-Output ONLY:
-<code>
-# python code
-</code>""",
-
-    "codecontests_valid_big": """Solve the following competitive programming problem in Python.
-
-Rules:
-- Read from stdin and write to stdout.
-- Your program MUST produce output when executed (call solve() under main guard, or execute at top-level).
-- Use fast I/O if needed (sys.stdin.buffer).
-- Do NOT print anything except the required output.
-
-{prompt}
-
-Output ONLY:
-<code>
-# python code
-</code>""",
-
-    "codecontests_test": """Solve the following competitive programming problem in Python.
-
-Rules:
-- Read from stdin and write to stdout.
-- Your program MUST produce output when executed (call solve() under main guard, or execute at top-level).
-- Use fast I/O if needed (sys.stdin.buffer).
-- Do NOT print anything except the required output.
-
-{prompt}
-
-Output ONLY:
-<code>
-# python code
-</code>""",
-}
-
-
-def format_prompt(raw_prompt: str, dataset_key: str, entry_point: str = "", example_call: str = "") -> str:
-    """
-    格式化原始 prompt，添加指令模板
-
-    Args:
-        raw_prompt: 原始题目 prompt
-        dataset_key: 数据集名称
-        entry_point: 函数入口点（MBPP 需要）
-        example_call: 调用形式示例（MBPP 需要，如 remove_Occ("hello","l")）
-
-    Returns:
-        格式化后的 user prompt
-    """
-    template = PROMPT_TEMPLATES.get(dataset_key)
-    if not template:
-        # 默认模板
-        return f"""Solve the following problem in Python.
-
-{raw_prompt}
-
-Output ONLY:
-<code>
-# python code
-</code>"""
-
-    # MBPP 需要 entry_point 和 example_call，显式分支避免 KeyError
-    if dataset_key == "mbpp_reg":
-        if not entry_point:
-            # 报错避免静默训练无效样本
-            raise ValueError(f"MBPP entry_point is empty for prompt: {raw_prompt[:50]}...")
-        if not example_call:
-            raise ValueError(f"MBPP example_call is empty for prompt: {raw_prompt[:50]}...")
-        return template.format(prompt=raw_prompt, entry_point=entry_point, example_call=example_call)
-
-    # 其他数据集直接格式化
-    return template.format(prompt=raw_prompt)
-
 
 # =============================================================================
 # 数据集配置
@@ -689,103 +534,10 @@ def evaluate_with_submit_api(
     sandbox_id: str,
     config: EvalConfig,
 ) -> EvalResult:
-    """
-    使用 SandboxFusion submit() API 评测代码
-
-    submit() API 特点：
-    - 依赖 SandboxFusion 内置的测试用例数据
-    - 自动处理代码提取、编译、执行
-    - 返回详细的测试结果
-
-    Args:
-        completion: 模型生成的代码
-        sandbox_dataset: SandboxFusion 数据集名称
-        sandbox_id: 问题 ID
-        config: 评测配置
-
-    Returns:
-        EvalResult 包含 accepted、pass_ratio、error_type 等
-    """
-    if not SANDBOX_AVAILABLE:
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=False,
-            pass_ratio=0.0,
-            error_type="sdk_unavailable",
-            judge_time=0.0,
-            details={"error": "SandboxFusion SDK not available"},
-        )
-
-    start_time = time.time()
-
-    # 空输出处理
-    if not completion or not completion.strip():
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=False,
-            pass_ratio=0.0,
-            error_type="empty_output",
-            judge_time=time.time() - start_time,
-            details={},
-        )
-
-    try:
-        # 设置 SandboxFusion 服务地址
-        set_sandbox_endpoint(config.sandbox_url)
-
-        # submit_safe: submit 的安全版本，自动捕获异常
-        # 参数：
-        #   dataset: 数据集名称
-        #   id: 问题 ID
-        #   completion: 提交的代码
-        #   config: 测试配置（语言、超时等）
-        result = submit_safe(SubmitRequest(
-            dataset=sandbox_dataset,
-            id=sandbox_id,
-            completion=completion,
-            config=TestConfig(
-                language='python',
-                run_timeout=config.run_timeout,
-            )
-        ))
-
-        judge_time = time.time() - start_time
-
-        # 解析评测结果
-        accepted = result.accepted  # 是否全部通过
-        tests = result.tests or []  # 每个测试用例的结果
-
-        # 计算 pass_ratio（通过的测试用例比例）
-        if tests:
-            passed = sum(1 for t in tests if getattr(t, 'status', '') == "success")
-            pass_ratio = passed / len(tests)
-        else:
-            pass_ratio = 1.0 if accepted else 0.0
-
-        # 确定错误类型
-        error_type = "success" if accepted else _determine_error_type(tests)
-
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=accepted,
-            pass_ratio=pass_ratio,
-            error_type=error_type,
-            judge_time=judge_time,
-            details={
-                "extracted_code": result.extracted_code,  # SandboxFusion 提取的代码
-                "test_count": len(tests),
-            },
-        )
-
-    except Exception as e:
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=False,
-            pass_ratio=0.0,
-            error_type="api_error",
-            judge_time=time.time() - start_time,
-            details={"error": str(e)},
-        )
+    del completion, sandbox_dataset, sandbox_id, config
+    raise RuntimeError(
+        "evaluate_with_submit_api() is deprecated. Shared truth only uses project external tests via evaluate_with_run_code()."
+    )
 
 
 def evaluate_with_compute_score(
@@ -794,120 +546,10 @@ def evaluate_with_compute_score(
     sandbox_id: str,
     config: EvalConfig,
 ) -> EvalResult:
-    """
-    使用 verl compute_score() 评测代码
-
-    compute_score 是 verl 框架用于 GRPO 训练的评分函数
-    使用它可以确保评测与训练阶段一致
-
-    Args:
-        completion: 模型生成的代码
-        test_cases: 测试用例字典
-        sandbox_id: 问题 ID
-        config: 评测配置
-
-    Returns:
-        EvalResult
-    """
-    if not VERL_COMPUTE_SCORE_AVAILABLE:
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=False,
-            pass_ratio=0.0,
-            error_type="compute_score_unavailable",
-            judge_time=0.0,
-            details={"error": "verl compute_score not available"},
-        )
-
-    start_time = time.time()
-
-    if not completion or not completion.strip():
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=False,
-            pass_ratio=0.0,
-            error_type="empty_output",
-            judge_time=time.time() - start_time,
-            details={},
-        )
-
-    try:
-        # compute_score: verl 的评分函数
-        # 返回 (score, metadata_list)
-        #   score: 0.0-1.0 的分数
-        #   metadata_list: 每个测试用例的详细结果
-        score, metadata_list = compute_score(
-            sandbox_fusion_url=f"{config.sandbox_url}/run_code",
-            memory_limit_mb=config.memory_limit_mb,
-            completion=completion,
-            test_cases=test_cases,
-            continuous=False,  # False = 二值评分（0 或 1）
-            timeout=config.run_timeout,
-        )
-
-        judge_time = time.time() - start_time
-        accepted = (score == 1.0)
-
-        error_type = _determine_error_type_from_metadata(metadata_list)
-
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=accepted,
-            pass_ratio=score,
-            error_type=error_type,
-            judge_time=judge_time,
-            details={"metadata": metadata_list},
-        )
-
-    except Exception as e:
-        return EvalResult(
-            problem_id=sandbox_id,
-            accepted=False,
-            pass_ratio=0.0,
-            error_type="api_error",
-            judge_time=time.time() - start_time,
-            details={"error": str(e)},
-        )
-
-
-def _determine_error_type(tests) -> str:
-    """
-    从 submit() 返回的测试结果确定错误类型
-
-    错误类型优先级：
-    1. syntax_error / compile_error: 语法错误
-    2. runtime_error: 运行时错误
-    3. timeout: 超时
-    4. wrong_answer: 输出不正确
-    """
-    for test in tests:
-        status = getattr(test, 'status', 'unknown')
-        if status == "syntax_error" or status == "compile_error":
-            return "syntax_error"
-        elif status == "runtime_error":
-            return "runtime_error"
-        elif status == "timeout":
-            return "timeout"
-    return "wrong_answer"
-
-
-def _determine_error_type_from_metadata(metadata_list) -> str:
-    """从 compute_score 的 metadata 确定错误类型"""
-    if not metadata_list:
-        return "unknown"
-
-    for meta in metadata_list:
-        status = meta.get('status', 'unknown')
-        if status == "compile_error":
-            return "syntax_error"
-        elif status == "runtime_error":
-            return "runtime_error"
-        elif status == "timeout":
-            return "timeout"
-        elif status == "success":
-            continue
-
-    return "wrong_answer"
+    del completion, test_cases, sandbox_id, config
+    raise RuntimeError(
+        "evaluate_with_compute_score() is deprecated. Shared truth and GRPO reward must use the shared verifier path."
+    )
 
 
 def _parse_run_code_result(result) -> Tuple[str, str, str, Optional[int]]:
@@ -1103,6 +745,28 @@ def _normalize_ws(s: str) -> str:
     return " ".join((s or "").split())
 
 
+def _summary_to_eval_result(problem_id: str, summary: Dict[str, Any]) -> EvalResult:
+    details = {
+        "passed_tests": summary.get("passed_tests", 0),
+        "total_tests": summary.get("total_tests", 0),
+        "pass_ratio_all": summary.get("pass_ratio_all", 0.0),
+        "invalid_for_rl": summary.get("invalid_for_rl", False),
+        "invalid_reason": summary.get("invalid_reason", ""),
+        "extraction_status": summary.get("extraction_status", "ok"),
+    }
+    if summary.get("per_case_results") is not None:
+        details["per_case_results"] = summary["per_case_results"]
+
+    return EvalResult(
+        problem_id=problem_id,
+        accepted=bool(summary.get("accepted", False)),
+        pass_ratio=float(summary.get("pass_ratio_all", 0.0)),
+        error_type=str(summary.get("error_type", "unknown")),
+        judge_time=float(summary.get("judge_time_s", 0.0)),
+        details=details,
+    )
+
+
 def evaluate_with_run_code(
     completion: str,
     test_cases: Dict[str, Any],
@@ -1141,48 +805,27 @@ def evaluate_with_run_code(
             details={"error": "SandboxFusion SDK not available"},
         )
 
-    start_time = time.time()
-
-    if not completion or not completion.strip():
-        return EvalResult(
-            problem_id=problem_id,
-            accepted=False,
-            pass_ratio=0.0,
-            error_type="empty_output",
-            judge_time=time.time() - start_time,
-            details={},
-        )
-
-    # 获取测试用例类型
-    test_type = test_cases.get("type", "unknown")
-
     try:
-        set_sandbox_endpoint(config.sandbox_url)
-
-        # 根据测试用例类型选择评测函数
-        if test_type == "humaneval":
-            return _evaluate_humaneval(completion, test_cases, problem_id, config, start_time)
-        elif test_type == "mbpp":
-            return _evaluate_mbpp(completion, test_cases, problem_id, config, start_time)
-        elif test_type == "codecontests":
-            return _evaluate_codecontests(completion, test_cases, problem_id, config, start_time)
-        else:
-            return EvalResult(
-                problem_id=problem_id,
-                accepted=False,
-                pass_ratio=0.0,
-                error_type="unknown_test_type",
-                judge_time=time.time() - start_time,
-                details={"error": f"Unknown test type: {test_type}"},
-            )
-
+        candidate = normalize_candidate(completion)
+        summary = verify_candidate(
+            candidate=candidate,
+            problem_id=problem_id,
+            test_cases=test_cases,
+            sandbox_endpoint=config.sandbox_url,
+            run_timeout_s=config.run_timeout,
+            memory_limit_mb=config.memory_limit_mb,
+            limiter_budget=config.verifier_limiter_budget,
+            include_per_case_results=test_cases.get("type") == "codecontests",
+            autofix_codecontests_entrypoint=config.autofix_codecontests_entrypoint,
+        ).to_dict()
+        return _summary_to_eval_result(problem_id, summary)
     except Exception as e:
         return EvalResult(
             problem_id=problem_id,
             accepted=False,
             pass_ratio=0.0,
             error_type="api_error",
-            judge_time=time.time() - start_time,
+            judge_time=0.0,
             details={"error": str(e)},
         )
 
@@ -1925,43 +1568,24 @@ async def evaluate_single_problem_async(
     batch_item: Dict[str, Any],
     config: EvalConfig,
     judge_semaphore: asyncio.Semaphore,
-    testcase_semaphore: asyncio.Semaphore,
 ) -> EvalResult:
     """
     异步评测单题。
 
     说明：
-    - codecontests + 外部测试：走测试点级异步并发
-    - 其他路径：沿用阻塞 SDK，使用 asyncio.to_thread 包装
+    - shared verifier 是唯一主判题路径
+    - 所有 external tests 都走 run_code，不再回退到 submit()
     """
     problem_id = batch_item["problem_id"]
-    sandbox_dataset = batch_item["sandbox_dataset"]
     test_cases = batch_item.get("test_cases")
 
     async with judge_semaphore:
         try:
             if test_cases and config.use_external_tests:
-                test_type = test_cases.get("type", "unknown")
-                if test_type == "codecontests" and SANDBOX_ASYNC_AVAILABLE and run_code_async is not None:
-                    return await _evaluate_codecontests_async(
-                        completion=generated_code,
-                        test_cases=test_cases,
-                        problem_id=problem_id,
-                        config=config,
-                        testcase_semaphore=testcase_semaphore,
-                    )
                 return await asyncio.to_thread(
                     evaluate_with_run_code,
                     generated_code,
                     test_cases,
-                    problem_id,
-                    config,
-                )
-            if config.use_submit_api:
-                return await asyncio.to_thread(
-                    evaluate_with_submit_api,
-                    generated_code,
-                    sandbox_dataset,
                     problem_id,
                     config,
                 )
@@ -1970,9 +1594,9 @@ async def evaluate_single_problem_async(
                 problem_id=problem_id,
                 accepted=False,
                 pass_ratio=0.0,
-                error_type="api_error",
+                error_type="no_test_cases",
                 judge_time=0.0,
-                details={"error": "No evaluator enabled (use_external_tests=False and use_submit_api=False)"},
+                details={"error": "No external test cases available for verifier"},
             )
         except Exception as e:
             return EvalResult(
@@ -2057,7 +1681,6 @@ async def evaluate_dataset(
     # 记录开始时间（用于计算 throughput）
     dataset_start_time = time.time()
     judge_semaphore = asyncio.Semaphore(max(1, config.max_concurrent_judges))
-    testcase_semaphore = asyncio.Semaphore(max(1, config.max_concurrent_testcases))
 
     # 分批处理
     for batch_start in range(0, len(prompts), config.batch_size):
@@ -2123,7 +1746,6 @@ async def evaluate_dataset(
                     batch_item=batch[i],
                     config=config,
                     judge_semaphore=judge_semaphore,
-                    testcase_semaphore=testcase_semaphore,
                 )
             )
 
@@ -2173,7 +1795,13 @@ async def evaluate_dataset(
                     "response": response_cut,
                     "accepted": eval_result.accepted,
                     "pass_ratio": eval_result.pass_ratio,
+                    "pass_ratio_all": eval_result.details.get("pass_ratio_all", eval_result.pass_ratio),
+                    "passed_tests": eval_result.details.get("passed_tests"),
+                    "total_tests": eval_result.details.get("total_tests"),
                     "error_type": eval_result.error_type,
+                    "invalid_for_rl": eval_result.details.get("invalid_for_rl", False),
+                    "invalid_reason": eval_result.details.get("invalid_reason", ""),
+                    "extraction_status": eval_result.details.get("extraction_status", "ok"),
                     "judge_time": eval_result.judge_time,
                     "gen_tokens": gen_tokens,
                     "gen_time": gen_time,
@@ -2513,13 +2141,9 @@ Examples:
 
     # === 评测方式 ===
     parser.add_argument("--use_external_tests", dest="use_external_tests", action="store_true", default=True,
-                        help="使用外部测试用例（从 raw 数据加载，默认启用）")
+                        help="使用项目数据自带的外部测试用例（默认启用）")
     parser.add_argument("--no_external_tests", dest="use_external_tests", action="store_false",
-                        help="禁用外部测试用例（回退到 submit API）")
-    parser.add_argument("--use_submit_api", dest="use_submit_api", action="store_true", default=True,
-                        help="使用 SandboxFusion submit API（依赖内置数据，默认启用）")
-    parser.add_argument("--no_submit_api", dest="use_submit_api", action="store_false",
-                        help="禁用 submit API（需要外部测试用例，否则无法评测）")
+                        help="禁用外部测试用例（此时 shared verifier 无法工作）")
 
     # === 数据集配置 ===
     parser.add_argument("--datasets", nargs="+", type=str,
@@ -2555,8 +2179,8 @@ Examples:
                         help="生成阶段最大并发请求数")
     parser.add_argument("--max_concurrent_judges", type=int, default=16,
                         help="判题阶段最大并发数（异步并发执行 Sandbox 评测）")
-    parser.add_argument("--max_concurrent_testcases", type=int, default=64,
-                        help="测试点级并发上限（全局限流，适用于 codecontests 外部测试）")
+    parser.add_argument("--verifier_limiter_budget", type=int, default=8,
+                        help="shared verifier 的全局 sandbox 并发预算")
     parser.add_argument("--batch_size", type=int, default=50,
                         help="批处理大小")
 
@@ -2575,7 +2199,6 @@ Examples:
         run_timeout=args.run_timeout,
         temperature=args.temperature,
         max_new_tokens=args.max_tokens,
-        use_submit_api=args.use_submit_api,
         use_external_tests=args.use_external_tests,
         datasets=args.datasets,
         manifest_dir=args.manifest_dir,
@@ -2589,7 +2212,7 @@ Examples:
         wandb_project=args.wandb_project,
         max_concurrent_requests=args.max_concurrent,
         max_concurrent_judges=args.max_concurrent_judges,
-        max_concurrent_testcases=args.max_concurrent_testcases,
+        verifier_limiter_budget=args.verifier_limiter_budget,
         batch_size=args.batch_size,
     )
 

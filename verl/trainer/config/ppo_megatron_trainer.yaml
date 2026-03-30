@@ -109,6 +109,7 @@ actor_rollout_ref:
 custom_reward_function:
   path: null
   name: compute_score
+  reward_kwargs: {}
 
 algorithm:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs

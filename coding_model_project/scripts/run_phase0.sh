@@ -41,6 +41,7 @@ RUN_TIMEOUT=30
 
 # 并发配置（单卡 4090）
 MAX_CONCURRENT=32
+VERIFIER_LIMITER_BUDGET=8
 BATCH_SIZE=50
 
 # 数据集
@@ -66,6 +67,7 @@ echo "  temperature:    $TEMPERATURE"
 echo "  max_tokens:     $MAX_TOKENS"
 echo "  run_timeout:    ${RUN_TIMEOUT}s"
 echo "  max_concurrent: $MAX_CONCURRENT"
+echo "  verifier_limiter_budget: $VERIFIER_LIMITER_BUDGET"
 echo ""
 
 # 检查服务
@@ -91,7 +93,8 @@ if [ -d "data/manifests" ] && [ "$(ls -A data/manifests/*.jsonl 2>/dev/null)" ];
     MANIFEST_ARG="--manifest_dir data/manifests"
     echo "Using manifest files from data/manifests/"
 else
-    echo "No manifest files found, will use SandboxFusion built-in data"
+    echo "ERROR: manifest files are required because shared verifier only uses project external tests."
+    exit 1
 fi
 echo ""
 
@@ -110,6 +113,7 @@ python src/phase0_eval.py \
     --max_tokens $MAX_TOKENS \
     --run_timeout $RUN_TIMEOUT \
     --max_concurrent $MAX_CONCURRENT \
+    --verifier_limiter_budget $VERIFIER_LIMITER_BUDGET \
     --batch_size $BATCH_SIZE \
     --output_dir "$OUTPUT_DIR"
 

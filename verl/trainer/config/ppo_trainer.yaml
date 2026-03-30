@@ -65,6 +65,9 @@ custom_reward_function:
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
 
+  # Extra kwargs forwarded to the custom reward function.
+  reward_kwargs: {}
+
 # config for the algorithm
 algorithm:
 

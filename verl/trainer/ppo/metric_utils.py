@@ -225,6 +225,47 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def _to_numpy(values: Any) -> np.ndarray:
+    if isinstance(values, np.ndarray):
+        return values
+    return np.asarray(values)
+
+
+def compute_verifier_metrics(batch: DataProto) -> dict[str, Any]:
+    """Aggregate compact verifier summaries from reward_extra_info."""
+    metrics: dict[str, Any] = {}
+    non_tensor_batch = batch.non_tensor_batch
+
+    if "pass_ratio_all" in non_tensor_batch:
+        pass_ratio_all = _to_numpy(non_tensor_batch["pass_ratio_all"]).astype(float)
+        metrics["verifier/pass_ratio_all_mean"] = float(np.mean(pass_ratio_all))
+
+    if "accepted" in non_tensor_batch:
+        accepted = _to_numpy(non_tensor_batch["accepted"]).astype(float)
+        metrics["verifier/accepted_rate"] = float(np.mean(accepted))
+
+    if "invalid_for_rl" in non_tensor_batch:
+        invalid_for_rl = _to_numpy(non_tensor_batch["invalid_for_rl"]).astype(float)
+        metrics["verifier/invalid_for_rl_rate"] = float(np.mean(invalid_for_rl))
+
+    if "judge_time_s" in non_tensor_batch:
+        judge_time_s = _to_numpy(non_tensor_batch["judge_time_s"]).astype(float)
+        metrics["verifier/judge_time_s_mean"] = float(np.mean(judge_time_s))
+        metrics["verifier/judge_time_s_p95"] = float(np.percentile(judge_time_s, 95))
+
+    if "extraction_status" in non_tensor_batch:
+        extraction_status = _to_numpy(non_tensor_batch["extraction_status"]).astype(str)
+        for status in ("empty_output", "non_code", "extraction_failure"):
+            metrics[f"verifier/{status}_rate"] = float(np.mean(extraction_status == status))
+
+    if "error_type" in non_tensor_batch:
+        error_type = _to_numpy(non_tensor_batch["error_type"]).astype(str)
+        for status in ("syntax_error", "runtime_error", "timeout", "wrong_answer"):
+            metrics[f"verifier/{status}_rate"] = float(np.mean(error_type == status))
+
+    return metrics
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.
