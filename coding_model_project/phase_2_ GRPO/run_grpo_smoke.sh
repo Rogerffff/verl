@@ -42,6 +42,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     reward_manager.source=register \
     reward_manager.name=batch \
+    reward_model.use_reward_loop=False \
     reward_model.launch_reward_fn_async=False \
     custom_reward_function.path=$PROJECT_ROOT/coding_model_project/src/grpo_batch_reward.py \
     custom_reward_function.name=compute_score \
