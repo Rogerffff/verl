@@ -247,7 +247,7 @@ def main():
     parser.add_argument(
         "--step_smoke_train_size",
         type=int,
-        default=8,
+        default=16,
         help="Number of samples in step_smoke_train.parquet.",
     )
     parser.add_argument(
