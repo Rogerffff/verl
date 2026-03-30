@@ -137,6 +137,8 @@ def build_default_splits(
     output_dir: Path,
     smoke_train_size: int,
     smoke_val_size: int,
+    step_smoke_train_size: int,
+    step_smoke_val_size: int,
     seed: int,
 ) -> Dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +190,8 @@ def build_default_splits(
     smoke_train_records = _sample_records(train_records, smoke_train_size, seed)
     smoke_val_source = val_tier1_records if val_tier1_records else val_tier2_records
     smoke_val_records = _sample_records(smoke_val_source, smoke_val_size, seed)
+    step_smoke_train_records = _sample_records(train_records, step_smoke_train_size, seed)
+    step_smoke_val_records = _sample_records(smoke_val_source, step_smoke_val_size, seed)
 
     files = {
         "train": output_dir / "train.parquet",
@@ -196,6 +200,8 @@ def build_default_splits(
         "final_eval": output_dir / "final_eval.parquet",
         "smoke_train": output_dir / "smoke_train.parquet",
         "smoke_val": output_dir / "smoke_val.parquet",
+        "step_smoke_train": output_dir / "step_smoke_train.parquet",
+        "step_smoke_val": output_dir / "step_smoke_val.parquet",
     }
     _write_parquet(train_records, files["train"])
     _write_parquet(val_tier1_records, files["val_tier1"])
@@ -203,6 +209,8 @@ def build_default_splits(
     _write_parquet(final_eval_records, files["final_eval"])
     _write_parquet(smoke_train_records, files["smoke_train"])
     _write_parquet(smoke_val_records, files["smoke_val"])
+    _write_parquet(step_smoke_train_records, files["step_smoke_train"])
+    _write_parquet(step_smoke_val_records, files["step_smoke_val"])
 
     summary = {
         "train": len(train_records),
@@ -211,6 +219,8 @@ def build_default_splits(
         "final_eval": len(final_eval_records),
         "smoke_train": len(smoke_train_records),
         "smoke_val": len(smoke_val_records),
+        "step_smoke_train": len(step_smoke_train_records),
+        "step_smoke_val": len(step_smoke_val_records),
         "files": {name: str(path) for name, path in files.items()},
     }
     summary_path = output_dir / "build_summary.json"
@@ -234,6 +244,18 @@ def main():
     )
     parser.add_argument("--smoke_train_size", type=int, default=64, help="Number of samples in smoke_train.parquet.")
     parser.add_argument("--smoke_val_size", type=int, default=32, help="Number of samples in smoke_val.parquet.")
+    parser.add_argument(
+        "--step_smoke_train_size",
+        type=int,
+        default=8,
+        help="Number of samples in step_smoke_train.parquet.",
+    )
+    parser.add_argument(
+        "--step_smoke_val_size",
+        type=int,
+        default=8,
+        help="Number of samples in step_smoke_val.parquet.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for smoke dataset sampling.")
     args = parser.parse_args()
 
@@ -242,6 +264,8 @@ def main():
         output_dir=args.output_dir,
         smoke_train_size=args.smoke_train_size,
         smoke_val_size=args.smoke_val_size,
+        step_smoke_train_size=args.step_smoke_train_size,
+        step_smoke_val_size=args.step_smoke_val_size,
         seed=args.seed,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
