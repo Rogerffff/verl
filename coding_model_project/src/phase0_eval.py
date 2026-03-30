@@ -1808,6 +1808,8 @@ async def evaluate_dataset(
                     "finish_reason": finish_reason,
                     "details": eval_result.details,
                 }
+                if "per_case_results" in eval_result.details:
+                    per_problem_record["per_case_results"] = eval_result.details["per_case_results"]
                 per_problem_f.write(json.dumps(per_problem_record, ensure_ascii=False) + "\n")
 
             results.append({
