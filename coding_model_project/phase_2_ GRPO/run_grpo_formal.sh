@@ -75,7 +75,9 @@ COMMON_ARGS=(
     data.seed=$SEED
     trainer.n_gpus_per_node=4
     trainer.nnodes=1
-    algorithm.filter_groups.enable=false
+    +algorithm.filter_groups.enable=false
+    +algorithm.filter_groups.metric=null
+    +algorithm.filter_groups.max_num_gen_batches=0
 )
 
 case "$ALGO_VARIANT" in
