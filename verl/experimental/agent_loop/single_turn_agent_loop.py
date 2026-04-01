@@ -63,6 +63,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 image_data=images,
                 video_data=videos,
             )
+        finish_reason = output.finish_reason
         response_mask = [1] * len(output.token_ids)
 
         output = AgentLoopOutput(
@@ -79,4 +80,6 @@ class SingleTurnAgentLoop(AgentLoopBase):
             num_turns=2,
             metrics=metrics,
         )
+        output.extra_fields["finish_reason"] = finish_reason
+        output.extra_fields["truncated_by_max_tokens"] = finish_reason == "length"
         return output

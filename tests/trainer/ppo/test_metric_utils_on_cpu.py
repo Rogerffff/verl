@@ -25,8 +25,10 @@ from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
+    compute_grpo_group_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_verifier_metrics,
     process_validation_metrics,
 )
 from verl.utils.metric import (
@@ -318,6 +320,61 @@ class TestProcessValidationMetrics(unittest.TestCase):
 
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
+
+    def test_process_validation_metrics_reward_raw_ignores_nan(self):
+        data_sources = ["source1", "source1", "source1", "source1"]
+        sample_inputs = ["prompt1", "prompt1", "prompt2", "prompt2"]
+        infos_dict = {
+            "reward_raw": [np.nan, np.nan, 1.0, 0.0],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("reward_raw", result["source1"])
+        self.assertAlmostEqual(result["source1"]["reward_raw"]["mean@2"], 0.5)
+        self.assertFalse(np.isnan(result["source1"]["reward_raw"]["mean@2"]))
+
+
+class TestVerifierAndGrpoMetrics(unittest.TestCase):
+    def test_compute_verifier_metrics_reward_raw_and_truncation(self):
+        batch = MagicMock()
+        batch.non_tensor_batch = {
+            "reward_raw": np.array([0.25, np.nan, 0.75]),
+            "truncated_by_max_tokens": np.array([True, False, False]),
+            "invalid_for_rl": np.array([True, False, True]),
+        }
+
+        metrics = compute_verifier_metrics(batch)
+
+        self.assertEqual(metrics["verifier/reward_raw_valid_count"], 2)
+        self.assertAlmostEqual(metrics["verifier/reward_raw_valid_rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["verifier/reward_raw_mean"], 0.5)
+        self.assertAlmostEqual(metrics["verifier/truncated_by_max_tokens_rate"], 1 / 3)
+        self.assertAlmostEqual(metrics["verifier/invalid_for_rl_rate"], 2 / 3)
+
+    def test_compute_verifier_metrics_omits_reward_raw_mean_when_all_invalid(self):
+        batch = MagicMock()
+        batch.non_tensor_batch = {
+            "reward_raw": np.array([np.nan, np.nan]),
+        }
+
+        metrics = compute_verifier_metrics(batch)
+
+        self.assertEqual(metrics["verifier/reward_raw_valid_count"], 0)
+        self.assertEqual(metrics["verifier/reward_raw_valid_rate"], 0.0)
+        self.assertNotIn("verifier/reward_raw_mean", metrics)
+
+    def test_compute_grpo_group_metrics_counts_all_invalid_groups(self):
+        batch = MagicMock()
+        batch.non_tensor_batch = {
+            "uid": np.array(["g1", "g1", "g2", "g2", "g3"], dtype=object),
+            "invalid_for_rl": np.array([True, True, False, True, False]),
+        }
+
+        metrics = compute_grpo_group_metrics(batch)
+
+        self.assertEqual(metrics["grpo/all_invalid_group_count"], 1)
+        self.assertAlmostEqual(metrics["grpo/all_invalid_group_rate"], 1 / 3)
 
 
 if __name__ == "__main__":

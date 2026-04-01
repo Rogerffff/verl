@@ -13,22 +13,52 @@
 # limitations under the License.
 
 import random
+import importlib.util
+import sys
+import types
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
-import verl.trainer.ppo.core_algos
-from verl.trainer.ppo.core_algos import (
-    compute_gae_advantage_return,
-    compute_grpo_outcome_advantage,
-    compute_grpo_vectorized_outcome_advantage,
-    compute_rloo_outcome_advantage,
-    compute_rloo_vectorized_outcome_advantage,
-    get_adv_estimator_fn,
-    register_adv_est,
-)
+
+def _load_private_core_algos_module():
+    repo_root = Path(__file__).resolve().parents[3]
+    module_path = repo_root / "verl" / "trainer" / "ppo" / "core_algos.py"
+    module_name = "_test_private_core_algos"
+
+    stub_workers_config = types.ModuleType("verl.workers.config")
+    stub_workers_config.ActorConfig = type("ActorConfig", (), {})
+    stub_workers_config.FSDPEngineConfig = type("FSDPEngineConfig", (), {})
+
+    previous_workers_config = sys.modules.get("verl.workers.config")
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    sys.modules["verl.workers.config"] = stub_workers_config
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous_workers_config is None:
+            sys.modules.pop("verl.workers.config", None)
+        else:
+            sys.modules["verl.workers.config"] = previous_workers_config
+
+    return module
+
+
+core_algos = _load_private_core_algos_module()
+compute_gae_advantage_return = core_algos.compute_gae_advantage_return
+compute_grpo_outcome_advantage = core_algos.compute_grpo_outcome_advantage
+compute_grpo_vectorized_outcome_advantage = core_algos.compute_grpo_vectorized_outcome_advantage
+compute_rloo_outcome_advantage = core_algos.compute_rloo_outcome_advantage
+compute_rloo_vectorized_outcome_advantage = core_algos.compute_rloo_vectorized_outcome_advantage
+get_adv_estimator_fn = core_algos.get_adv_estimator_fn
+register_adv_est = core_algos.register_adv_est
 
 
 def mock_test_fn():
@@ -38,15 +68,15 @@ def mock_test_fn():
 class TestRegisterAdvEst(unittest.TestCase):
     def setUp(self):
         """Clear the registry before each test"""
-        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
-        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY = {
+        core_algos.ADV_ESTIMATOR_REGISTRY.clear()
+        core_algos.ADV_ESTIMATOR_REGISTRY = {
             "gae": lambda x: x * 2,
             "vtrace": lambda x: x + 1,
         }
-        self.ADV_ESTIMATOR_REGISTRY = verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY
+        self.ADV_ESTIMATOR_REGISTRY = core_algos.ADV_ESTIMATOR_REGISTRY
 
     def tearDown(self) -> None:
-        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
+        core_algos.ADV_ESTIMATOR_REGISTRY.clear()
         return super().tearDown()
 
     def test_register_new_function(self):
@@ -311,6 +341,67 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_grpo_invalid_mask_excludes_invalid_members_from_group_stats():
+    token_level_rewards = torch.tensor([[1.0], [3.0], [100.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt_a", "prompt_a", "prompt_a"], dtype=object)
+    invalid_mask = np.array([False, False, True])
+
+    advantages, returns = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        invalid_mask=invalid_mask,
+    )
+
+    valid_scores = torch.tensor([1.0, 3.0], dtype=torch.float32)
+    expected_std = torch.std(valid_scores)
+    expected = torch.tensor(
+        [[(1.0 - 2.0) / expected_std], [(3.0 - 2.0) / expected_std], [0.0]],
+        dtype=torch.float32,
+    )
+
+    assert torch.allclose(advantages, expected, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(returns, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_grpo_all_invalid_group_returns_zero_without_nan():
+    token_level_rewards = torch.tensor([[5.0], [7.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt_a", "prompt_a"], dtype=object)
+    invalid_mask = np.array([True, True])
+
+    advantages, returns = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        invalid_mask=invalid_mask,
+    )
+
+    assert torch.equal(advantages, torch.zeros_like(token_level_rewards))
+    assert torch.equal(returns, torch.zeros_like(token_level_rewards))
+    assert not torch.isnan(advantages).any()
+    assert not torch.isnan(returns).any()
+
+
+def test_grpo_single_valid_survivor_returns_zero_advantage():
+    token_level_rewards = torch.tensor([[5.0], [100.0], [200.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt_a", "prompt_a", "prompt_a"], dtype=object)
+    invalid_mask = np.array([False, True, True])
+
+    advantages, returns = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        invalid_mask=invalid_mask,
+    )
+
+    expected = torch.zeros_like(token_level_rewards)
+    assert torch.equal(advantages, expected)
+    assert torch.equal(returns, expected)
 
 
 if __name__ == "__main__":

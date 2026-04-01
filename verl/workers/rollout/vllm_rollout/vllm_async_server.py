@@ -1068,7 +1068,11 @@ class vLLMHttpServerBase:
             stop_reason = finish_reason
 
         return TokenOutput(
-            token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts, stop_reason=stop_reason
+            token_ids=token_ids,
+            log_probs=log_probs,
+            routed_experts=routed_experts,
+            stop_reason=stop_reason,
+            finish_reason=finish_reason,
         )
 
     async def wake_up(self):

@@ -19,6 +19,7 @@ import warnings
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, cast
 
+import numpy as np
 import ray
 import torch
 
@@ -55,6 +56,44 @@ async def _call_with_kwargs_async(raw_fn, extra_kwargs, *args, **kwargs):
     """
     merged_kwargs = {**kwargs, **extra_kwargs}
     return await raw_fn(*args, **merged_kwargs)
+
+
+def _coerce_non_tensor_field(values: Any, *, batch_size: int) -> list[Any]:
+    if values is None:
+        return [None] * batch_size
+
+    array = np.asarray(values, dtype=object)
+    if array.shape[0] != batch_size:
+        raise ValueError(f"Expected non-tensor field batch size {batch_size}, got {array.shape[0]}")
+    return array.tolist()
+
+
+def merge_generation_metadata_into_extra_info(batch):
+    finish_reasons = batch.non_tensor_batch.get("finish_reason")
+    truncated_flags = batch.non_tensor_batch.get("truncated_by_max_tokens")
+    if finish_reasons is None and truncated_flags is None:
+        return batch
+
+    batch_size = len(batch)
+    finish_reason_values = _coerce_non_tensor_field(finish_reasons, batch_size=batch_size)
+    truncated_values = _coerce_non_tensor_field(truncated_flags, batch_size=batch_size)
+    extra_info_values = _coerce_non_tensor_field(batch.non_tensor_batch.get("extra_info"), batch_size=batch_size)
+
+    merged_extra_infos = np.empty(batch_size, dtype=object)
+    for idx in range(batch_size):
+        original_extra_info = extra_info_values[idx]
+        extra_info = dict(original_extra_info) if isinstance(original_extra_info, dict) else {}
+        finish_reason = finish_reason_values[idx]
+        finish_reason_text = None if finish_reason is None else str(finish_reason)
+        extra_info["finish_reason"] = finish_reason_text
+        if truncated_values[idx] is None:
+            extra_info["truncated_by_max_tokens"] = finish_reason_text == "length"
+        else:
+            extra_info["truncated_by_max_tokens"] = bool(truncated_values[idx])
+        merged_extra_infos[idx] = extra_info
+
+    batch.non_tensor_batch["extra_info"] = merged_extra_infos
+    return batch
 
 
 def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:

@@ -108,6 +108,9 @@ class TokenOutput(BaseModel):
     stop_reason: Optional[str] = None
     """停止原因：'completed'（正常结束）, 'aborted'（被中断）, None（未知）"""
 
+    finish_reason: Optional[str] = None
+    """后端原始 finish_reason，例如 'stop'、'length'、'abort'。"""
+
 
 class RolloutMode(Enum):
     """

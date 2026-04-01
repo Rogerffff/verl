@@ -45,13 +45,14 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_grpo_group_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_verifier_metrics,
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.reward import compute_reward, compute_reward_async, merge_generation_metadata_into_extra_info
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -242,6 +243,7 @@ def compute_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
+            invalid_mask=data.non_tensor_batch.get("invalid_for_rl"),
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         data.batch["advantages"] = advantages
@@ -587,6 +589,8 @@ class RayPPOTrainer:
         # Otherwise, compute reward using reward_fn
         if reward_fn is None:
             raise ValueError("reward_fn must be provided when rm_scores is not available.")
+
+        batch = merge_generation_metadata_into_extra_info(batch)
 
         if return_dict:
             result = reward_fn(batch, return_dict=True)
@@ -1911,6 +1915,7 @@ class RayPPOTrainer:
                 # - response_length/mean: 平均响应长度
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_verifier_metrics(batch=batch))
+                metrics.update(compute_grpo_group_metrics(batch=batch))
                 
                 # 【计时 metrics】各阶段耗时分布
                 # 用于识别训练瓶颈（生成 vs 奖励计算 vs 模型更新）

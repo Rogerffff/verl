@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable, List
 
 try:
@@ -14,20 +15,56 @@ def _coerce_iterable(values: Iterable[Any]) -> list[Any]:
     return list(values)
 
 
-def _map_reward(summary: dict[str, Any], reward_mode: str) -> float:
+def _is_truncated(extra_info: Any) -> bool:
+    if not isinstance(extra_info, dict):
+        return False
+
+    finish_reason = extra_info.get("finish_reason")
+    return bool(extra_info.get("truncated_by_max_tokens", finish_reason == "length"))
+
+
+def _apply_invalid_guardrails(summary: dict[str, Any], *, extra_info: Any) -> dict[str, Any]:
+    result = dict(summary)
+    finish_reason = extra_info.get("finish_reason") if isinstance(extra_info, dict) else None
+    truncated_by_max_tokens = _is_truncated(extra_info)
+
+    result["finish_reason"] = finish_reason
+    result["truncated_by_max_tokens"] = truncated_by_max_tokens
+
+    if truncated_by_max_tokens:
+        result["invalid_for_rl"] = True
+        result["invalid_reason"] = "truncated_by_max_tokens"
+
+    return result
+
+
+def _compute_reward_raw(summary: dict[str, Any], reward_mode: str) -> float:
     if summary["invalid_for_rl"]:
-        return 0.0
+        return math.nan
+
+    error_type = summary["error_type"]
 
     if reward_mode == "sparse_accepted":
         return 1.0 if summary["accepted"] else 0.0
+
+    if reward_mode == "anchored_dense_v1":
+        if error_type in {"syntax_error", "empty_output", "non_code", "extraction_failure"}:
+            return -1.0
+        return 0.8 * float(summary["pass_ratio_all"]) + 0.2 * float(summary["accepted"])
+
+    if reward_mode == "dense_anchor_v1":
+        if error_type in {"syntax_error", "empty_output", "non_code", "extraction_failure"}:
+            return -1.0
+        reward = -0.2 + 1.0 * float(summary["pass_ratio_all"]) + 0.2 * float(summary["accepted"])
+        return max(-1.0, min(1.0, reward))
 
     if reward_mode == "dense_pass_ratio":
         return float(summary["pass_ratio_all"])
 
     if reward_mode == "rltf_piecewise":
-        if summary["error_type"] in {"syntax_error", "empty_output", "non_code", "extraction_failure"}:
+        if error_type in {"syntax_error", "empty_output", "non_code", "extraction_failure"}:
             return -1.0
-        if summary["error_type"] in {"runtime_error", "timeout"}:
+        if error_type in {"runtime_error", "timeout"}:
             return -0.6
         reward = -0.3 + 1.3 * float(summary["pass_ratio_all"])
         return max(-1.0, min(1.0, reward))
@@ -68,9 +105,11 @@ def compute_score(
 
     results: List[dict[str, Any]] = []
     for summary, extra_info in zip(summaries, extra_info_list, strict=True):
-        summary_dict = summary.to_dict()
+        summary_dict = _apply_invalid_guardrails(summary.to_dict(), extra_info=extra_info)
         summary_dict.pop("per_case_results", None)
-        summary_dict["score"] = _map_reward(summary_dict, reward_mode=reward_mode)
+        reward_raw = _compute_reward_raw(summary_dict, reward_mode=reward_mode)
+        summary_dict["reward_raw"] = reward_raw
+        summary_dict["score"] = 0.0 if math.isnan(reward_raw) else reward_raw
         summary_dict["problem_id"] = ""
         if isinstance(extra_info, dict):
             summary_dict["problem_id"] = str(extra_info.get("problem_id", ""))

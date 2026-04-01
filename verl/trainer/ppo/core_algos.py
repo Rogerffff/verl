@@ -268,6 +268,7 @@ def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
+    invalid_mask: Optional[np.ndarray | torch.Tensor] = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -283,6 +284,8 @@ def compute_grpo_outcome_advantage(
             shape is (bs, response_length)
         index: `(np.ndarray)`
             index array for grouping
+        invalid_mask: `(Optional[np.ndarray | torch.Tensor])`
+            invalid samples will be excluded from GRPO group statistics and assigned zero advantage/return
         epsilon: `(float)`
             small value to avoid division by zero
         norm_adv_by_std_in_grpo: `(bool)`
@@ -301,6 +304,10 @@ def compute_grpo_outcome_advantage(
             shape is (bs, response_length)
     """
     scores = token_level_rewards.sum(dim=-1)
+    if invalid_mask is None:
+        invalid_flags = torch.zeros(scores.shape[0], dtype=torch.bool, device=scores.device)
+    else:
+        invalid_flags = torch.as_tensor(invalid_mask, dtype=torch.bool, device=scores.device)
 
     id2score = defaultdict(list)
     id2mean = {}
@@ -309,11 +316,12 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            if not invalid_flags[i]:
+                id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
+                id2mean[idx] = id2score[idx][0]
+                id2std[idx] = torch.tensor(1.0, device=scores.device)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
                 id2mean[idx] = torch.mean(scores_tensor)
@@ -321,7 +329,9 @@ def compute_grpo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
+            if invalid_flags[i] or index[i] not in id2mean:
+                scores[i] = 0.0
+            elif norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]

@@ -231,6 +231,11 @@ def _to_numpy(values: Any) -> np.ndarray:
     return np.asarray(values)
 
 
+def _finite_float_array(values: Any) -> np.ndarray:
+    array = _to_numpy(values).astype(float)
+    return array[np.isfinite(array)]
+
+
 def compute_verifier_metrics(batch: DataProto) -> dict[str, Any]:
     """Aggregate compact verifier summaries from reward_extra_info."""
     metrics: dict[str, Any] = {}
@@ -248,6 +253,18 @@ def compute_verifier_metrics(batch: DataProto) -> dict[str, Any]:
         invalid_for_rl = _to_numpy(non_tensor_batch["invalid_for_rl"]).astype(float)
         metrics["verifier/invalid_for_rl_rate"] = float(np.mean(invalid_for_rl))
 
+    if "truncated_by_max_tokens" in non_tensor_batch:
+        truncated_by_max_tokens = _to_numpy(non_tensor_batch["truncated_by_max_tokens"]).astype(float)
+        metrics["verifier/truncated_by_max_tokens_rate"] = float(np.mean(truncated_by_max_tokens))
+
+    if "reward_raw" in non_tensor_batch:
+        reward_raw = _finite_float_array(non_tensor_batch["reward_raw"])
+        total_count = len(_to_numpy(non_tensor_batch["reward_raw"]))
+        metrics["verifier/reward_raw_valid_count"] = int(reward_raw.size)
+        metrics["verifier/reward_raw_valid_rate"] = float(reward_raw.size / total_count) if total_count > 0 else 0.0
+        if reward_raw.size > 0:
+            metrics["verifier/reward_raw_mean"] = float(np.nanmean(reward_raw))
+
     if "judge_time_s" in non_tensor_batch:
         judge_time_s = _to_numpy(non_tensor_batch["judge_time_s"]).astype(float)
         metrics["verifier/judge_time_s_mean"] = float(np.mean(judge_time_s))
@@ -263,6 +280,28 @@ def compute_verifier_metrics(batch: DataProto) -> dict[str, Any]:
         for status in ("syntax_error", "runtime_error", "timeout", "wrong_answer"):
             metrics[f"verifier/{status}_rate"] = float(np.mean(error_type == status))
 
+    return metrics
+
+
+def compute_grpo_group_metrics(batch: DataProto) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    non_tensor_batch = batch.non_tensor_batch
+
+    if "uid" not in non_tensor_batch or "invalid_for_rl" not in non_tensor_batch:
+        return metrics
+
+    uid_array = _to_numpy(non_tensor_batch["uid"])
+    invalid_array = _to_numpy(non_tensor_batch["invalid_for_rl"]).astype(bool)
+
+    uid_to_all_invalid: dict[Any, bool] = {}
+    for uid, invalid in zip(uid_array.tolist(), invalid_array.tolist(), strict=True):
+        uid_to_all_invalid[uid] = uid_to_all_invalid.get(uid, True) and bool(invalid)
+
+    total_groups = len(uid_to_all_invalid)
+    all_invalid_group_count = sum(uid_to_all_invalid.values())
+
+    metrics["grpo/all_invalid_group_count"] = int(all_invalid_group_count)
+    metrics["grpo/all_invalid_group_rate"] = float(all_invalid_group_count / total_groups) if total_groups > 0 else 0.0
     return metrics
 
 
@@ -595,12 +634,22 @@ def process_validation_metrics(
                 if isinstance(var_vals[0], str):
                     continue
 
+                filtered_vals = list(var_vals)
+                filtered_preds = list(var2vals["pred"]) if var2vals.get("pred", None) is not None else None
+                if var_name == "reward_raw":
+                    finite_indices = [idx for idx, value in enumerate(filtered_vals) if np.isfinite(float(value))]
+                    if not finite_indices:
+                        continue
+                    filtered_vals = [filtered_vals[idx] for idx in finite_indices]
+                    if filtered_preds is not None:
+                        filtered_preds = [filtered_preds[idx] for idx in finite_indices]
+
                 metric = {}
-                n_resps = len(var_vals)
-                metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                n_resps = len(filtered_vals)
+                metric[f"mean@{n_resps}"] = np.mean(filtered_vals)
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = np.std(var_vals)
+                    metric[f"std@{n_resps}"] = np.std(filtered_vals)
 
                     ns = []
                     n = 2
@@ -611,13 +660,14 @@ def process_validation_metrics(
 
                     for n in ns:
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
-                            data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
+                            data=filtered_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )
                         metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
                         metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
-                        if var2vals.get("pred", None) is not None:
+                        if filtered_preds is not None:
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"], strict=True)
+                                {"val": val, "pred": pred}
+                                for val, pred in zip(filtered_vals, filtered_preds, strict=True)
                             ]
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(
                                 data=vote_data,
