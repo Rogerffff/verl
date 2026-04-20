@@ -1,0 +1,56 @@
+{"problem_id": "Codeforces/1016/D", "prompt_sha256": "0fc845e5404fd167bd0725250be8f864fd2eaa79028b34ae90ac44e4e52e5bd1", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1025/B", "prompt_sha256": "fd08aa36fcbd45a66ec1e1345beb47e799c12aa3f494e9169f34958a6c2cb932", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1036/F", "prompt_sha256": "ca22b6cf3347ca636c73506d93adf11094454177e3c7567683bcb517e6e8ec04", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1095/C", "prompt_sha256": "5d0652438605f6f96f4b5b6cf4a5ee2c087edb6eb29d56535672c19124e64ec3", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1101/C", "prompt_sha256": "9a1969dc434ee9c5c96838f086a330da9c96b0e858fbcd904061c1ac9c830fc2", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/119/C", "prompt_sha256": "f9ae69b29112f870c37855d295cb6dfb970310de2e9b6017a7d1730f15f868bc", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1207/B", "prompt_sha256": "baa1b7009ca2ac7adacab855a4489f3cfc3af5337ca16e32f232115307423292", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1209/G2", "prompt_sha256": "68eb948b1a1bfede90e8cd3f24cc81e9ce92726a343834073c4167e7e5cf30a9", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1294/C", "prompt_sha256": "bca395ae4878ea96fdf339df4acc023305cd1f59a0a295b8397d9e00c6e684df", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1388/A", "prompt_sha256": "5542b6ed5f3044b3d903ca4bd0e790820fd887f832c7152dfe3efbb710534acd", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/1508/B", "prompt_sha256": "a37cd455f3b4e065bb9240a8406eb59f8f4a3a96f0b5de0c4de2d8dd0423e666", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/316/E2", "prompt_sha256": "4c1e2f48ec5c0847c2a15797a7b0275b4ecdbe767fc33e97f3e9958b37e227ee", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "Codeforces/486/B", "prompt_sha256": "6760e6c5b8ada081a425892ec0001b9c85a5d3d48fcc8369c7a85dfc69702fb1", "teacher_keep_source": "near_miss_testcase_audit_high_confidence"}
+{"problem_id": "AIZU/p02461", "prompt_sha256": "cef50c5bb6bdd8e30261e85929d18de9f8b2bf06cab55ca0fcd8396bc0a937d9", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "Codeforces/1041/C", "prompt_sha256": "0ba338dc52a18d3f8b7c61c7706a73b2aaa4c24aba13b9789757914e9cb8ceba", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "Codeforces/47/B", "prompt_sha256": "d476da2777493ab8b27b72835d40aeb881126475b5bff0878df16c29f8c0ae37", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "Codeforces/540/B", "prompt_sha256": "3c82f2ae8660016e1366ba448ff8543d3d4e242ab76efd0cde9694c0b367639a", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "Codeforces/549/B", "prompt_sha256": "6f0edde250d5b19f9dab15b422677eef75cb19dd260f674939f60534fe997b17", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "Codeforces/584/C", "prompt_sha256": "2dafebb42f283436656115cd55d876bed3d7733829549e27d2bf641e1bb3773e", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "HackerEarth/fibonacci-madness", "prompt_sha256": "ddbaa6ff50afe8e4bb19d27c69b842900512adf39a25a01c6f4e0891f2257820", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "p03815 AtCoder Beginner Contest 053 - X: Yet Another Die Game", "prompt_sha256": "a1ca993ebf0b23c5fd21f06b24f17ad4b711c43746bfe85944240514511e1c15", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "p03917 CODE FESTIVAL 2016 Final - Reverse Grid", "prompt_sha256": "36221cb30c45d4d33d5be1f85210818b2fbe7841eaf2652a75f66d20a5429e77", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "p03952 AtCoder Grand Contest 006 - Median Pyramid Easy", "prompt_sha256": "b89d81719f2aed407db4b4d20b4964db242bb30e1eb1770fcb58d7a8e2f03b95", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "p03994 CODE FESTIVAL 2016 qual A - Next Letter", "prompt_sha256": "8b6184b5bcb0e5281dd4205fb0e8000731d861d60f18a09ede3c89c778a1d99d", "teacher_keep_source": "near_miss_testcase_audit_regen_round1"}
+{"problem_id": "Codeforces/1000/F", "prompt_sha256": "78f26d6578f4e2065ffb4896d8ce86a4f1372741765f8a0449d7365764acbbdd", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/1040/B", "prompt_sha256": "9eccb2bda3224cf39a259a55ebeffba1f375f809d133148a4b1da88430cc5c46", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/1075/A", "prompt_sha256": "10c400a52fe1f3a0fcbe40297d78f915c15444f1e3be5db732ec5fa2f1302466", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/1111/A", "prompt_sha256": "111b728671f8165d7e20820b2a25aff27f14e0021c86e3688585c09953da29b7", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/1144/F", "prompt_sha256": "bb625e3cd44c5950b6e1f8705cb2a2fd4790dc2b3d572c8da96e7416f8678f46", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/1157/C1", "prompt_sha256": "baffba8a73afeef955480043c819b3542617117b7cf87bbed88f915c6c603c29", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/1209/G1", "prompt_sha256": "b597067f88fbb5d59784ee1cc9b665a0b7c7ce1a9e1bb72647376c6ac783f9e7", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/1225/A", "prompt_sha256": "73e2a5890f68369f3e18d4a72f1d16880b13b6fd03e3642ab68dfd00dd7c925c", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/228/E", "prompt_sha256": "2b47d093a4e0b8ac03d99d95547a8a9d38fb9037677d9e6d4176e7cd34d3213f", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/230/B", "prompt_sha256": "c9e57252344e9a243c5b8a343c8a33154d547897083041b84587539d3ca44194", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/242/E", "prompt_sha256": "cbb146dad70063fd00cbd165432f6e066c94dddd86741a0f110337327c2edda3", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/267/B", "prompt_sha256": "45ee9ee095e9ab785debeb7d4449d2818d54de0717153807d7a10d21ba098888", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/33/B", "prompt_sha256": "13e26795bef38783cda304776dc1a3f3d8eef52fd1649c360544040f0c4eea51", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/35/C", "prompt_sha256": "3b095466274b488958c7a1e5502f23451579b0a7889f2fec283268839a5638a8", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/400/D", "prompt_sha256": "0aef564a7f8e8c913910a8f2a24284d4756367f72da25c6447dc12ba1b35e711", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/472/A", "prompt_sha256": "d77d7c26f2059a48b779157907cd50693c1f694a8a141a2e88fa5f195f996f7d", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/550/C", "prompt_sha256": "92584bec6b61b79e9a09926d61c95f5b3f6293b0928de7546061028c889aa4a6", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/659/B", "prompt_sha256": "61cf5252752d548d8f9bcb8e29a0634e0e50e7b1f8423e55928d8aa92127c90e", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "Codeforces/808/C", "prompt_sha256": "ba1381bd69a5118f1a2ebbd1e91ec5ae0b51133ac6017f1f3c0200a0975f6ef2", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "p03158 AISing Programming Contest 2019 - Nearest Card Game", "prompt_sha256": "cd5abe354cfb5cff2b253b977502caec1a45d7653a9628ada3305a77f9bf8a3c", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "p03963 AtCoder Beginner Contest 046 - Painting Balls with AtCoDeer", "prompt_sha256": "3b7e709089299bb2dcaff044807b300342e0a233590018c329442f3c9b9f1ca6", "teacher_keep_source": "remaining_high_pass_audit_0p7_to_0p85"}
+{"problem_id": "AIZU/p00396", "prompt_sha256": "7ed924f4f895db9aa8a8e55580ea2602684f5f146c8d37287b950ef27cf110f3", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "CodeChef/cteams", "prompt_sha256": "e665451505706c92d2bb432993399cd49c1d33f64482ce884beaade7c84f102d", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/1114/B", "prompt_sha256": "d0504595546b0d0b7c46eea4dcb6616cb7ecfc58de3b8e95abbdeddb028fc640", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/1156/B", "prompt_sha256": "d8b001cd84b96f4324ea6e3c26df6b3030297be118129ea549dc6ce37efecbcb", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/1271/B", "prompt_sha256": "29632ec2ae8a6efab5c6019be76d2e4382dfa1785cd33bede7de2d05150a124d", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/1476/E", "prompt_sha256": "84c7b2fcbcfc2a97cd384c2e2fa9d59c93ee8ae262b134c10a57dc4171a00a95", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/1526/A", "prompt_sha256": "eeb9cfbf035681ac35cc5cb5fc394b2a1435ff1830aeded11c497ec69894b490", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/164/C", "prompt_sha256": "8687d4169de7a37a69a3c91d900f92bdab3e33c58c6ed66132c396f551b8ce61", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/39/K", "prompt_sha256": "e5b917c4340712f6e5fe24ec4c34d68a1f5828f3e0967b473f0e5833caafe52f", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/761/D", "prompt_sha256": "27b0f5dd18cd90571a05f1efcce7b0aaa2224c4d2be8f3a3924c8fcf42a92929", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
+{"problem_id": "Codeforces/794/D", "prompt_sha256": "db3ba0eeecc3628eed0065d224797c2967ecfa36b02626f318060b4030ef1319", "teacher_keep_source": "remaining_high_pass_audit_0p85_to_0p9"}
