@@ -11,6 +11,7 @@ except ImportError:
 
 BAD_OUTPUT_ERROR_TYPES = {"syntax_error", "empty_output", "non_code", "extraction_failure"}
 SUPPORTED_REWARD_MODES = {"repair_delta_v0"}
+_MISSING = object()
 
 
 def _coerce_iterable(values: Iterable[Any]) -> list[Any]:
@@ -45,6 +46,13 @@ def _unit_interval(value: Any, *, field_name: str) -> float:
     if not 0.0 <= number <= 1.0:
         raise ValueError(f"Expected {field_name} in [0, 1], got {number}")
     return number
+
+
+def _require_field(mapping: dict[str, Any], key: str, *, field_name: str) -> Any:
+    value = mapping.get(key, _MISSING)
+    if value is _MISSING:
+        raise ValueError(f"Repair reward requires {field_name}")
+    return value
 
 
 def _is_truncated(extra_info: Any) -> bool:
@@ -94,8 +102,13 @@ def _extract_first_pass_fields(ground_truth: Any, extra_info: Any) -> dict[str, 
 
     return {
         "problem_id": problem_id,
-        "first_pass_pass_ratio_all": _unit_interval(first_pass.get("pass_ratio_all", 0.0), field_name="first_pass.pass_ratio_all"),
-        "first_pass_accepted": _as_bool(first_pass.get("accepted")),
+        "first_pass_pass_ratio_all": _unit_interval(
+            _require_field(first_pass, "pass_ratio_all", field_name="ground_truth.first_pass.pass_ratio_all"),
+            field_name="first_pass.pass_ratio_all",
+        ),
+        "first_pass_accepted": _as_bool(
+            _require_field(first_pass, "accepted", field_name="ground_truth.first_pass.accepted")
+        ),
         "first_pass_bucket": _as_str(first_pass.get("pass_ratio_bucket")),
         "first_pass_error_type": _as_str(first_pass.get("error_type")),
         "first_pass_invalid_for_rl": _as_bool(first_pass.get("invalid_for_rl")),
@@ -181,6 +194,18 @@ def compute_score(
     solution_list = _coerce_iterable(solution_strs)
     ground_truth_list = _coerce_iterable(ground_truths)
     extra_info_list = _coerce_iterable(extra_infos)
+    first_pass_list = [
+        _extract_first_pass_fields(ground_truth, extra_info)
+        for ground_truth, extra_info in zip(ground_truth_list, extra_info_list, strict=True)
+    ]
+
+    if expected_prompt_mode:
+        for first_pass in first_pass_list:
+            if first_pass["repair_prompt_mode"] != expected_prompt_mode:
+                raise ValueError(
+                    "Repair prompt mode mismatch: "
+                    f"expected {expected_prompt_mode!r}, got {first_pass['repair_prompt_mode']!r}"
+                )
 
     candidates = [normalize_candidate(solution) for solution in solution_list]
     summaries = verify_candidate_batch(
@@ -195,15 +220,9 @@ def compute_score(
     )
 
     results: List[dict[str, Any]] = []
-    for summary, ground_truth, extra_info in zip(summaries, ground_truth_list, extra_info_list, strict=True):
+    for summary, first_pass, extra_info in zip(summaries, first_pass_list, extra_info_list, strict=True):
         summary_dict = _apply_invalid_guardrails(summary.to_dict(), extra_info=extra_info)
         summary_dict.pop("per_case_results", None)
-        first_pass = _extract_first_pass_fields(ground_truth, extra_info)
-        if expected_prompt_mode and first_pass["repair_prompt_mode"] != expected_prompt_mode:
-            raise ValueError(
-                "Repair prompt mode mismatch: "
-                f"expected {expected_prompt_mode!r}, got {first_pass['repair_prompt_mode']!r}"
-            )
         reward_raw, repair_logs = _compute_repair_delta_v0(summary=summary_dict, first_pass=first_pass)
 
         result = dict(summary_dict)

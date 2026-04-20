@@ -140,6 +140,29 @@ def test_compute_score_requires_first_pass_contract(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("missing_key", "error_match"),
+    [
+        ("pass_ratio_all", "ground_truth.first_pass.pass_ratio_all"),
+        ("accepted", "ground_truth.first_pass.accepted"),
+    ],
+)
+def test_compute_score_requires_frozen_first_pass_baseline_fields(monkeypatch, missing_key, error_match):
+    _patch_verifier(monkeypatch, [_base_summary()])
+    ground_truth = _base_ground_truth()
+    ground_truth["first_pass"].pop(missing_key)
+
+    with pytest.raises(ValueError, match=error_match):
+        repair_grpo_batch_reward.compute_score(
+            data_sources=["codecontests_repair_rl"],
+            solution_strs=["<code>print('new')</code>"],
+            ground_truths=[ground_truth],
+            extra_infos=[{"problem_id": "p1", "finish_reason": "stop", "truncated_by_max_tokens": False}],
+            sandbox_endpoint="http://sandbox",
+            reward_mode="repair_delta_v0",
+        )
+
+
 def test_compute_score_returns_flat_fields_only(monkeypatch):
     _patch_verifier(monkeypatch, [_base_summary()])
 
@@ -158,7 +181,12 @@ def test_compute_score_returns_flat_fields_only(monkeypatch):
 
 
 def test_compute_score_checks_expected_prompt_mode(monkeypatch):
-    _patch_verifier(monkeypatch, [_base_summary()])
+    monkeypatch.setattr(repair_grpo_batch_reward, "normalize_candidate", lambda solution: solution)
+    monkeypatch.setattr(
+        repair_grpo_batch_reward,
+        "verify_candidate_batch",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("verifier should not be called on prompt mismatch")),
+    )
 
     with pytest.raises(ValueError, match="Repair prompt mode mismatch"):
         repair_grpo_batch_reward.compute_score(
