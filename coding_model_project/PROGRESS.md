@@ -1,6 +1,6 @@
 # RLVR Coding Model 项目进度文档
 
-> 最后更新：2026-03-19
+> 最后更新：2026-03-31
 
 ---
 
@@ -19,7 +19,7 @@
 | Phase 0 | Baseline 评测 | ✅ 已完成 | 完整评测基础设施、数据治理、基线指标 |
 | Phase 1 | SFT | ⚠️ 已实现/已搁置 | 代码和流水线就绪，但训练效果不佳 |
 | Phase 2 | DPO | ⏭️ 跳过 | 可选阶段，暂不执行 |
-| Phase 3 | GRPO | 🔜 下一步 | 直接从 base model 开始在线 RL |
+| Phase 3 | GRPO | 🚧 实现中 | 正式主线 A0/A1/A2 已进入落地，A1 short formal pilot 为当前第一优先级 |
 | Phase 4 | 多轮修复 | 📋 待定 | 可选 Agentic 扩展 |
 
 ---
@@ -78,6 +78,15 @@ SFT 训练效果不如 base model，原因是 SFT 数据质量/分布与目标�
 ---
 
 ## Phase 3: GRPO（下一步）
+
+### 当前正式主线决策
+
+- 主线算法：A1（DAPO-style stabilizations on GRPO）
+- reward v1 mainline：`anchored_dense_v1`
+- `invalid_for_rl` 语义：mixed group 只用 valid members 做组统计；all-invalid group 整组 advantage/return 置 0
+- rollout metadata：`finish_reason` / `truncated_by_max_tokens` 走 trainer-side `extra_info` merge
+- formal 入口：`run_grpo_formal.sh` + `run_grpo_a0.sh` / `run_grpo_a1.sh` / `run_grpo_a2.sh`
+- formal pilot 默认：4x5090、`rollout.n=8`、`train_batch_size=8`、`ppo_mini_batch_size=8`、`max_response_length=512`、`run_timeout_s=30`
 
 ### 已有基础
 

@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+"""离线评测与在线 GRPO reward 共用的共享判题模块。
+
+并发上的要点：本模块**没有**使用单一全局 ThreadPoolExecutor，而是在需要时
+在「批次级 / 候选级」与「测试用例级」分别开线程池；真正打到 Sandbox 的请求
+则统一受 ``limiter_budget`` 对应的 **BoundedSemaphore** 全局限制。
+
+也就是说：
+1. ``verify_candidate_batch()`` 可并发判多个候选；
+2. ``_verify_codecontests_candidate()`` 可对单个候选的多个 testcase 并发判题；
+3. 每次实际调用 ``run_code()`` 前都必须先 acquire 同一套 limiter，因此
+   在途 sandbox 请求数上限由 ``limiter_budget`` 决定。
+"""
+
 import ast
 import concurrent.futures
 import re
@@ -12,10 +25,14 @@ from typing import Any, Dict, Iterable, List, Optional
 
 _LIMITER_REGISTRY_LOCK = threading.Lock()
 _LIMITER_REGISTRY: dict[int, threading.BoundedSemaphore] = {}
+_SANDBOX_RR_LOCK = threading.Lock()
+_SANDBOX_RR_INDEX: dict[tuple[str, ...], int] = {}
 
 
 @dataclass
 class CandidateRecord:
+    """代码提取后的规范化模型输出。"""
+
     raw_completion: str
     extracted_code: str
     extraction_status: str
@@ -26,6 +43,8 @@ class CandidateRecord:
 
 @dataclass
 class VerificationSummary:
+    """评测与 RL 共用的判题结果契约。"""
+
     accepted: bool
     passed_tests: int
     total_tests: int
@@ -42,6 +61,7 @@ class VerificationSummary:
 
 
 def _get_limiter(limit: int) -> threading.BoundedSemaphore:
+    # 同一数值上限复用同一个信号量，使相同 budget 的调用共享全局并发上限。
     limit = max(1, int(limit))
     with _LIMITER_REGISTRY_LOCK:
         limiter = _LIMITER_REGISTRY.get(limit)
@@ -53,6 +73,7 @@ def _get_limiter(limit: int) -> threading.BoundedSemaphore:
 
 @contextmanager
 def _acquire_limiter(limit: int):
+    # 限制真实 sandbox RPC 并发；与由哪个线程池提交无关。
     limiter = _get_limiter(limit)
     limiter.acquire()
     try:
@@ -62,12 +83,36 @@ def _acquire_limiter(limit: int):
 
 
 def _lazy_import_sandbox():
+    # 延迟导入 SandboxFusion，仅做提取或离线处理时可避免 upfront 导入开销。
     from sandbox_fusion import RunCodeRequest, run_code
 
     return {
         "RunCodeRequest": RunCodeRequest,
         "run_code": run_code,
     }
+
+
+def _normalize_sandbox_endpoints(sandbox_endpoint: str) -> List[str]:
+    endpoints = [part.strip() for part in str(sandbox_endpoint or "").split(",") if part.strip()]
+    if not endpoints:
+        raise ValueError("sandbox_endpoint is empty")
+    return endpoints
+
+
+def primary_sandbox_endpoint(sandbox_endpoint: str) -> str:
+    return _normalize_sandbox_endpoints(sandbox_endpoint)[0]
+
+
+def _choose_sandbox_endpoint_rr(sandbox_endpoint: str) -> str:
+    endpoints = tuple(_normalize_sandbox_endpoints(sandbox_endpoint))
+    if len(endpoints) == 1:
+        return endpoints[0]
+
+    with _SANDBOX_RR_LOCK:
+        idx = _SANDBOX_RR_INDEX.get(endpoints, 0)
+        chosen = endpoints[idx % len(endpoints)]
+        _SANDBOX_RR_INDEX[endpoints] = (idx + 1) % len(endpoints)
+    return chosen
 
 
 def _enum_to_value(value: Any) -> str:
@@ -92,6 +137,7 @@ def _enum_to_value(value: Any) -> str:
 
 
 def _parse_run_code_result_detailed(result: Any) -> Dict[str, Any]:
+    # 将 SDK 返回对象压成普通 dict，下游分类逻辑不依赖 SDK 内部结构。
     overall_status = _enum_to_value(getattr(result, "status", "unknown")) or "unknown"
     message = str(getattr(result, "message", "") or "")
 
@@ -155,6 +201,11 @@ def _looks_like_python_code(text: str) -> bool:
 
 
 def _extract_code_block(completion: str) -> CandidateRecord:
+    # 提取策略尽量宽松：
+    # 1) 优先 <code>...</code>
+    # 2) 其次 markdown 代码块
+    # 3) 有标记但解析失败则 extraction_failure
+    # 4) 最后对 RL 裸输出用「像 Python」启发式兜底
     stripped = (completion or "").strip()
     if not stripped:
         return CandidateRecord(raw_completion=completion or "", extracted_code="", extraction_status="empty_output")
@@ -189,6 +240,7 @@ def normalize_candidate(raw_completion: str) -> CandidateRecord:
 
 
 def _codecontests_autofix_entrypoint(code: str) -> tuple[str, Dict[str, Any]]:
+    # 部分代码定义了 solve() 但未调用；stdin/stdout 型 CodeContests 可选项补 main 入口。
     solve_defined = re.search(r"^\s*def\s+solve\s*\(", code, re.MULTILINE) is not None
     solve_called = re.search(r"solve\s*\(", code.split("def solve", 1)[-1] if "def solve" in code else code) is not None
 
@@ -210,6 +262,7 @@ def _empty_or_invalid_summary(
     invalid_reason: str,
     include_per_case_results: bool,
 ) -> VerificationSummary:
+    # 提取失败或无代码时仍返回结构完整的 summary，评测与 RL 侧契约一致。
     per_case_results: Optional[List[Dict[str, Any]]]
     if include_per_case_results and total_tests > 0:
         per_case_results = [
@@ -246,7 +299,9 @@ def _run_code_request(
     limiter_budget: int,
     stdin: Optional[str] = None,
 ) -> Any:
+    # 唯一实际调用 SandboxFusion run_code() 的入口；上层并发最终都汇聚到此信号量。
     sandbox = _lazy_import_sandbox()
+    chosen_endpoint = _choose_sandbox_endpoint_rr(sandbox_endpoint)
     request_kwargs = {
         "code": code,
         "language": "python",
@@ -257,7 +312,7 @@ def _run_code_request(
         request_kwargs["stdin"] = stdin
 
     with _acquire_limiter(limiter_budget):
-        return sandbox["run_code"](sandbox["RunCodeRequest"](**request_kwargs), endpoint=sandbox_endpoint)
+        return sandbox["run_code"](sandbox["RunCodeRequest"](**request_kwargs), endpoint=chosen_endpoint)
 
 
 def _is_sandbox_error(parsed: Dict[str, Any]) -> bool:
@@ -265,6 +320,7 @@ def _is_sandbox_error(parsed: Dict[str, Any]) -> bool:
 
 
 def _classify_single_run(parsed: Dict[str, Any]) -> tuple[str, bool, str]:
+    # invalid_for_rl 留给基础设施/服务异常；模型侧错误（语法/运行/超时/WA）仍应参与 reward 学习。
     if _is_sandbox_error(parsed):
         return "sandbox_error", True, "sandbox_error"
     if parsed["run_status"] == "TimeLimitExceeded" or "timelimitexceeded" in parsed["run_stdout"].lower():
@@ -291,6 +347,7 @@ def _verify_humaneval_candidate(
     memory_limit_mb: int,
     limiter_budget: int,
 ) -> VerificationSummary:
+    # HumanEval：候选代码与隐藏测试拼成单文件，一次 sandbox 运行，全对或全错。
     total_tests = 1 if test_cases else 0
     if candidate.extraction_status != "ok":
         return _empty_or_invalid_summary(
@@ -360,6 +417,7 @@ def _verify_mbpp_candidate(
     memory_limit_mb: int,
     limiter_budget: int,
 ) -> VerificationSummary:
+    # MBPP：与 HumanEval 相同，单文件拼测、单次 sandbox、二元通过/失败。
     test_list = test_cases.get("test_list", [])
     if not test_list:
         return VerificationSummary(
@@ -445,6 +503,7 @@ def _verify_codecontests_testcase(
     memory_limit_mb: int,
     limiter_budget: int,
 ) -> Dict[str, Any]:
+    # CodeContests：一个 testcase 对应一次 sandbox 请求；粒度可并行多测，仍受共享 limiter 约束。
     stdin_input = testcase.get("input", "")
     expected_output = (testcase.get("output", "") or "").strip()
     try:
@@ -536,6 +595,7 @@ def _verify_codecontests_testcase(
 
 
 def _pick_primary_error(error_counts: Dict[str, int]) -> str:
+    # 汇总只暴露一个顶层 error_type：取次数占优者，平局时按固定优先级打破。
     if not error_counts:
         return "success"
     priority = {
@@ -560,6 +620,7 @@ def _verify_codecontests_candidate(
     include_per_case_results: bool,
     autofix_codecontests_entrypoint: bool,
 ) -> VerificationSummary:
+    # CodeContests：逐 testcase 独立执行再聚合，得到 passed_tests / total_tests / pass_ratio_all（稠密信号）。
     tests = test_cases.get("tests", [])
     if not tests:
         return VerificationSummary(
@@ -590,6 +651,7 @@ def _verify_codecontests_candidate(
         code, _ = _codecontests_autofix_entrypoint(code)
 
     start_time = time.time()
+    # 内层线程池：单候选内 testcase 级调度；可提交 len(tests) 个任务，真实 sandbox 并发仍由 _run_code_request 信号量限制。
     max_workers = max(1, min(len(tests), int(limiter_budget)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
@@ -605,6 +667,7 @@ def _verify_codecontests_candidate(
             )
             for index, testcase in enumerate(tests)
         ]
+        # 用 as_completed 尽快收集结果，随后按 test_idx 排序，与下游日志下标一致。
         per_case_results = [future.result() for future in concurrent.futures.as_completed(futures)]
 
     per_case_results.sort(key=lambda item: item["test_idx"])
@@ -654,7 +717,8 @@ def verify_candidate(
     include_per_case_results: bool = False,
     autofix_codecontests_entrypoint: bool = False,
 ) -> VerificationSummary:
-    del problem_id  # reserved for future trace/log extensions
+    # 按 test_cases.type 分派，评测与 RL 共用同一入口。
+    del problem_id  # 预留：后续 trace / 日志扩展
 
     if not test_cases:
         return VerificationSummary(
@@ -726,6 +790,7 @@ def verify_candidate_batch(
     include_per_case_results: bool = False,
     autofix_codecontests_entrypoint: bool = False,
 ) -> List[VerificationSummary]:
+    # 外层线程池：候选级并发；CodeContests 内层可能再开 testcase 池，但真实 RPC 仍受 limiter_budget 全局信号量限制。
     candidate_list = list(candidates)
     ground_truth_list = list(ground_truths)
     max_workers = max(1, min(len(candidate_list), int(limiter_budget)))

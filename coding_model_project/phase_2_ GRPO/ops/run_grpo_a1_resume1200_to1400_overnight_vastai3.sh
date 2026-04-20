@@ -1,0 +1,53 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export SANDBOX_URL=${SANDBOX_URL:-http://localhost:8090}
+export LIMITER_BUDGET=${LIMITER_BUDGET:-240}
+export RUN_TIMEOUT_S=${RUN_TIMEOUT_S:-30}
+export SEED=${SEED:-0}
+export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
+export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
+export PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
+export PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-8}
+export ROLLOUT_N=${ROLLOUT_N:-8}
+export ACTOR_OFFLOAD_POLICY=${ACTOR_OFFLOAD_POLICY:-True}
+export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
+export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
+export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
+export TRAINER_LOGGER=${TRAINER_LOGGER:-'["console"]'}
+
+export TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1400}
+export TEST_FREQ=${TEST_FREQ:-100}
+export SAVE_FREQ=${SAVE_FREQ:-100}
+export VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False}
+export SKIP_DATALOADER_STATE_LOAD=${SKIP_DATALOADER_STATE_LOAD:-False}
+export LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
+
+export CURRICULUM_START_GLOBAL_STEP=${CURRICULUM_START_GLOBAL_STEP:-580}
+# Resume at global_step=1200 -> local_update_step=620.
+# Segment the next 200 steps as:
+#   phase0: 1201..1260  => local_update_step 620..679
+#   phase1: 1261..1320  => local_update_step 680..739
+#   phase2: 1321..1400  => local_update_step 740+
+export CURRICULUM_PHASE_BOUNDARIES=${CURRICULUM_PHASE_BOUNDARIES:-"[680,740]"}
+export CURRICULUM_PHASE0_QUOTAS=${CURRICULUM_PHASE0_QUOTAS:-'{"U_unseen":6,"A_retention":2,"B_near_miss":4,"C_hard_partial":3,"D_dead_hard":1}'}
+export CURRICULUM_PHASE1_QUOTAS=${CURRICULUM_PHASE1_QUOTAS:-'{"U_unseen":5,"A_retention":2,"B_near_miss":4,"C_hard_partial":4,"D_dead_hard":1}'}
+export CURRICULUM_PHASE2_QUOTAS=${CURRICULUM_PHASE2_QUOTAS:-'{"U_unseen":4,"A_retention":3,"B_near_miss":5,"C_hard_partial":3,"D_dead_hard":1}'}
+export CURRICULUM_PHASE0_U_REVISIT_QUOTA=${CURRICULUM_PHASE0_U_REVISIT_QUOTA:-2}
+export CURRICULUM_PHASE1_U_REVISIT_QUOTA=${CURRICULUM_PHASE1_U_REVISIT_QUOTA:-1}
+export CURRICULUM_PHASE2_U_REVISIT_QUOTA=${CURRICULUM_PHASE2_U_REVISIT_QUOTA:-1}
+export CURRICULUM_PREFER_LOW_VISITS=${CURRICULUM_PREFER_LOW_VISITS:-True}
+export CURRICULUM_EMA_ALPHA=${CURRICULUM_EMA_ALPHA:-0.4}
+export CURRICULUM_MIN_VISITS=${CURRICULUM_MIN_VISITS:-2}
+export CURRICULUM_RECENT_EXCLUSION_WINDOW=${CURRICULUM_RECENT_EXCLUSION_WINDOW:-6}
+export CURRICULUM_SNAPSHOT_STEPS=${CURRICULUM_SNAPSHOT_STEPS:-"[1300,1400]"}
+export CURRICULUM_RESET_STATE_ON_DATASET_MISMATCH=${CURRICULUM_RESET_STATE_ON_DATASET_MISMATCH:-False}
+
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-"grpo_a1_curriculum_step1200_followup_u6a2b4c3d1_to1400_lb240_seed${SEED}_vastai3"}
+export RESUME_FROM_PATH=${RESUME_FROM_PATH:-"/workspace/verl/checkpoints/rlvr_coding_model/grpo_a1_curriculum_step1000_overnight_u5a4b4c3_to1200_lb240_seed${SEED}_vastai3/global_step_1200"}
+export RESUME_STATE_PATH=${RESUME_STATE_PATH:-"/workspace/verl/coding_model_project/curriculum_states/grpo_a1_curriculum_step1000_overnight_u5a4b4c3_to1200_lb240_seed${SEED}_vastai3/curriculum_state_step_1200.json"}
+
+bash "$SCRIPT_DIR/run_grpo_a1_resume580_to660_curriculum.sh" "$@"

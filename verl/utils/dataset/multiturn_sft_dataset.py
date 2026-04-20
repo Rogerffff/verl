@@ -166,6 +166,20 @@ class MultiTurnSFTDataset(Dataset):
         # =======================
         # Set defaults and extract parameters from config if provided
         config = config or {}
+        multiturn_config = config.get("multiturn", {}) if hasattr(config, "get") else {}
+        multiturn_config = multiturn_config or {}
+
+        def _get_multiturn_field(field_name: str, default):
+            # Prefer top-level fields for backward compatibility, but fall back to
+            # data.multiturn.* so fsdp_sft_trainer.yaml-style configs are honored.
+            top_level = config.get(field_name, None)
+            if top_level is not None:
+                return top_level
+            if hasattr(multiturn_config, "get"):
+                nested = multiturn_config.get(field_name, None)
+                if nested is not None:
+                    return nested
+            return default
 
         # 填充模式：
         # - "right": 在序列右侧填充至 max_length
@@ -188,21 +202,21 @@ class MultiTurnSFTDataset(Dataset):
         # =======================
         # 2. 数据字段名称配置
         # =======================
-        # Get messages_key from the new multiturn config structure
+        # Support both top-level data.* keys and nested data.multiturn.* keys.
         # 消息字段名，Parquet 文件中存储对话的列名
-        self.messages_key = config.get("messages_key", "messages")
+        self.messages_key = _get_multiturn_field("messages_key", "messages")
         # 图片字段名，存储图片路径或数据的列名
-        self.image_key = config.get("image_key", "images")
+        self.image_key = _get_multiturn_field("image_key", "images")
         # 视频字段名，存储视频路径或数据的列名
-        self.video_key = config.get("video_key", "videos")
+        self.video_key = _get_multiturn_field("video_key", "videos")
         # 图像 patch 大小，用于视觉模型
         self.image_patch_size = config.get(
             "image_patch_size", processor.image_processor.patch_size if processor else None
         )
         # 工具字段名，存储 function calling 工具定义的列名
-        self.tools_key = config.get("tools_key", "tools")
+        self.tools_key = _get_multiturn_field("tools_key", "tools")
         # 思考模式字段名（用于 Qwen3 等支持思考模式的模型）
-        self.enable_thinking_key = config.get("enable_thinking_key", "enable_thinking")
+        self.enable_thinking_key = _get_multiturn_field("enable_thinking_key", "enable_thinking")
 
         # apply_chat_template 的额外参数
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})

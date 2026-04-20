@@ -63,9 +63,9 @@ try:
 except ImportError:
     from prompting import SYSTEM_PROMPT, format_prompt
 try:
-    from coding_model_project.src.verifier import normalize_candidate, verify_candidate
+    from coding_model_project.src.verifier import normalize_candidate, primary_sandbox_endpoint, verify_candidate
 except ImportError:
-    from verifier import normalize_candidate, verify_candidate
+    from verifier import normalize_candidate, primary_sandbox_endpoint, verify_candidate
 
 # 评测配置常量（所有 Phase 共用）
 try:
@@ -871,7 +871,7 @@ def _evaluate_humaneval(
         language="python",
         run_timeout=config.run_timeout,
         memory_limit_MB=config.memory_limit_mb,  # 添加内存限制
-    ))
+    ), endpoint=primary_sandbox_endpoint(config.sandbox_url))
 
     judge_time = time.time() - start_time
 
@@ -961,7 +961,7 @@ def _evaluate_mbpp(
         language="python",
         run_timeout=config.run_timeout,
         memory_limit_MB=config.memory_limit_mb,  # 添加内存限制
-    ))
+    ), endpoint=primary_sandbox_endpoint(config.sandbox_url))
 
     judge_time = time.time() - start_time
 
@@ -1071,7 +1071,7 @@ def _evaluate_codecontests(
             run_timeout=config.run_timeout,
             memory_limit_MB=config.memory_limit_mb,  # 添加内存限制
             stdin=stdin_input,  # 传入标准输入
-        ))
+        ), endpoint=primary_sandbox_endpoint(config.sandbox_url))
 
         parsed = _parse_run_code_result_detailed(result)
         overall_status = parsed["overall_status"]
@@ -1239,7 +1239,7 @@ async def _run_codecontests_testcase_async(
                     memory_limit_MB=config.memory_limit_mb,
                     stdin=stdin_input,
                 ),
-                endpoint=config.sandbox_url,
+                endpoint=primary_sandbox_endpoint(config.sandbox_url),
                 client_timeout=client_timeout,
             )
         except Exception as e:
@@ -1461,7 +1461,7 @@ def _load_from_sandbox(dataset_key: str, sandbox_url: str) -> List[Dict[str, Any
     sandbox_dataset = cfg.get("sandbox_dataset", dataset_key)
     id_range = cfg.get("id_range")
 
-    set_sandbox_endpoint(sandbox_url)
+    set_sandbox_endpoint(primary_sandbox_endpoint(sandbox_url))
 
     try:
         # get_prompts: 获取数据集的所有题目
@@ -2131,7 +2131,7 @@ Examples:
 
     # === SandboxFusion 配置 ===
     parser.add_argument("--sandbox_url", type=str, default="http://localhost:8080",
-                        help="SandboxFusion 服务地址")
+                        help="SandboxFusion 服务地址；shared verifier 路径支持逗号分隔多个 backend 做客户端 round-robin")
     parser.add_argument("--run_timeout", type=int, default=EVAL_CONSTANTS.get("run_timeout", 30),
                         help="代码执行超时（秒）")
 
@@ -2163,6 +2163,10 @@ Examples:
                         help="保存全量 per-problem 结果到 output_dir/per_problem/（默认启用）")
     parser.add_argument("--no_save_full_results", dest="save_full_results", action="store_false",
                         help="不保存全量 per-problem 结果")
+    parser.add_argument("--max_prompt_chars", type=int, default=4000,
+                        help="per-problem 结果中 prompt 最大保留字符数")
+    parser.add_argument("--max_response_chars", type=int, default=12000,
+                        help="per-problem 结果中 response 最大保留字符数")
     parser.add_argument("--max_problems", type=int, default=None,
                         help="每个数据集最多评测多少题（用于大数据集快速跑统计）")
     parser.add_argument("--shuffle_seed", type=int, default=0,
@@ -2207,6 +2211,8 @@ Examples:
         output_dir=args.output_dir,
         qa_sample_size=args.qa_sample_size,
         save_full_results=args.save_full_results,
+        max_prompt_chars=args.max_prompt_chars,
+        max_response_chars=args.max_response_chars,
         max_problems=args.max_problems,
         shuffle_seed=args.shuffle_seed,
         autofix_codecontests_entrypoint=args.autofix_codecontests_entrypoint,

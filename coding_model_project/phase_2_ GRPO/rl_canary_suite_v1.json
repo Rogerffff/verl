@@ -1,0 +1,112 @@
+{
+  "version": "rl_canary_suite_v1",
+  "training_profile": {
+    "resume_from": "pre_sft_step200",
+    "continuation_steps": 60,
+    "save_freq": 20,
+    "test_freq": 10,
+    "default_canary_steps": [200, 220, 240, 260]
+  },
+  "retention_canary_codecontests": {
+    "source": "codecontests_valid + codecontests_valid_big",
+    "problem_ids": [
+      "Codeforces/1554/A",
+      "Codeforces/1559/A",
+      "Codeforces/1560/A",
+      "Codeforces/1162/B",
+      "Codeforces/371/D",
+      "Codeforces/75/D",
+      "Codeforces/909/A",
+      "Codeforces/492/A",
+      "Codeforces/1003/A",
+      "Codeforces/285/C"
+    ]
+  },
+  "timeout_canary_codecontests": {
+    "source": "codecontests_valid + codecontests_valid_big",
+    "problem_ids": [
+      "Codeforces/1569/C",
+      "Codeforces/1400/G",
+      "Codeforces/1107/B",
+      "Codeforces/172/B",
+      "Codeforces/1503/F",
+      "Codeforces/1538/B"
+    ]
+  },
+  "structural_hard_watchlist": {
+    "source": "codecontests_valid + codecontests_valid_big",
+    "problem_ids": [
+      "Codeforces/1572/C",
+      "Codeforces/1574/D",
+      "Codeforces/1553/F",
+      "Codeforces/1535/E",
+      "Codeforces/245/F",
+      "Codeforces/1517/D"
+    ]
+  },
+  "mid_val_codecontests_32": {
+    "source": "codecontests_valid + codecontests_valid_big",
+    "problem_ids": [
+      "Codeforces/44/C",
+      "Codeforces/1217/C",
+      "Codeforces/1244/F",
+      "Codeforces/1064/B",
+      "Codeforces/600/B",
+      "Codeforces/1476/G",
+      "Codeforces/1207/D",
+      "Codeforces/1175/G",
+      "Codeforces/1240/D",
+      "Codeforces/1380/F",
+      "Codeforces/236/A",
+      "Codeforces/402/C",
+      "Codeforces/387/A",
+      "Codeforces/934/B",
+      "Codeforces/204/E",
+      "Codeforces/1165/B",
+      "Codeforces/574/E",
+      "Codeforces/920/C",
+      "Codeforces/1551/C",
+      "Codeforces/1552/F",
+      "Codeforces/1553/I",
+      "Codeforces/1560/E",
+      "Codeforces/1552/B",
+      "Codeforces/1554/C",
+      "Codeforces/1556/H",
+      "Codeforces/1569/D",
+      "Codeforces/1569/A",
+      "Codeforces/1548/E",
+      "Codeforces/1556/C",
+      "Codeforces/1555/F",
+      "Codeforces/1561/A",
+      "Codeforces/1574/B"
+    ]
+  },
+  "benchmark_canary_specs": {
+    "humaneval_mini": {
+      "dataset": "humaneval",
+      "target_count": 0,
+      "selection_policy": "excluded from routine RL save-point canary; run only for spot-check/final full eval",
+      "problem_ids": []
+    },
+    "mbpp_reg_mini": {
+      "dataset": "mbpp_reg",
+      "target_count": 0,
+      "selection_policy": "excluded from routine RL save-point canary; run only for spot-check/final full eval",
+      "problem_ids": []
+    }
+  },
+  "full_eval_shortlist": [
+    "codecontests_valid",
+    "codecontests_valid_big",
+    "humaneval",
+    "mbpp_reg"
+  ],
+  "checkpoint_selection_rule": {
+    "primary": "mid_val_codecontests_32 score under guardrails",
+    "guardrails": [
+      "retention canary does not materially regress",
+      "timeout canary does not materially worsen",
+      "structural hard watchlist does not collapse"
+    ]
+  }
+}

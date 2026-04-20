@@ -1072,8 +1072,14 @@ class RayPPOTrainer:
 
         # load dataloader,
         # TODO: from remote not implemented yet
+        skip_dataloader_state_load = bool(getattr(self.config.trainer, "skip_dataloader_state_load", False))
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
+        if skip_dataloader_state_load:
+            print(
+                "Skipping dataloader state restore because trainer.skip_dataloader_state_load=True. "
+                f"Will start from scratch at current global step using {dataloader_local_path}."
+            )
+        elif os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:

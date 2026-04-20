@@ -14,8 +14,11 @@ ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1024}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
 ROLLOUT_N=${ROLLOUT_N:-1}
+RUN_TIMEOUT_S=${RUN_TIMEOUT_S:-15}
+ACTOR_OFFLOAD_POLICY=${ACTOR_OFFLOAD_POLICY:-True}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_step_smoke_shared_verifier}
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -35,6 +38,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=$ACTOR_OFFLOAD_POLICY \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.use_kl_loss=False \
@@ -53,10 +57,10 @@ python3 -m verl.trainer.main_ppo \
     +custom_reward_function.reward_kwargs.sandbox_endpoint=$SANDBOX_URL \
     +custom_reward_function.reward_kwargs.reward_mode=$REWARD_MODE \
     +custom_reward_function.reward_kwargs.limiter_budget=$LIMITER_BUDGET \
-    +custom_reward_function.reward_kwargs.run_timeout_s=30 \
+    +custom_reward_function.reward_kwargs.run_timeout_s=$RUN_TIMEOUT_S \
     +custom_reward_function.reward_kwargs.memory_limit_mb=1024 \
     trainer.project_name=rlvr_coding_model \
-    trainer.experiment_name=grpo_step_smoke_shared_verifier \
+    trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.logger='["console"]' \
     trainer.val_before_train=False \
     trainer.total_epochs=1 \

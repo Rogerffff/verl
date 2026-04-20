@@ -17,9 +17,28 @@
 7. [实验设计与实验矩阵](#7-实验设计与实验矩阵)
 8. [关键文件导航](#8-关键文件导航)
 
+> 正式算法决策正文见：
+> [algorithm_decision_guide.md](/Users/roger/Desktop/coding_RL_project/verl/coding_model_project/phase_2_%20GRPO/algorithm_decision_guide.md)
+
 ---
 
 ## 1. 项目总览与当前决策
+
+### 1.0 正式算法决策文档
+
+本 README 继续作为 GRPO 阶段的前置总览文档使用，负责汇总：
+
+- 项目背景
+- 基线结果
+- 数据文件说明
+- 评测脚本设计
+- 奖励函数与超参概览
+
+当前 Phase 3 的正式算法路线、A0/A1/A2 的定义、采用标准与实现前 checklist，统一以：
+
+- [algorithm_decision_guide.md](/Users/roger/Desktop/coding_RL_project/verl/coding_model_project/phase_2_%20GRPO/algorithm_decision_guide.md)
+
+为权威版本。
 
 ### 1.1 五阶段训练流水线
 
@@ -149,7 +168,7 @@ python src/phase0_eval.py \
 ```
 原始 CodeContests 数据
 │
-│  Step 1: 从 SandboxFusion 下载
+│  Step 1: 从 HF 下载
 │  ├─ codecontests_train_raw.jsonl   (13,328 条)   785 MB
 │  ├─ codecontests_valid_raw.jsonl   (117 条)       12 MB
 │  └─ codecontests_test_raw.jsonl    (165 条)       5.8 MB
@@ -484,7 +503,7 @@ reward = clip(reward, -1, 1)
 
 | 参数 | verl 配置键 | 建议值 | 说明 |
 |------|------------|--------|------|
-| group_size | `actor_rollout_ref.rollout.n` | 5 | 每个 prompt 采样条数 |
+| group_size | `actor_rollout_ref.rollout.n` | 8 | 当前主线起步配置；若吞吐过差再回调 |
 | temperature | rollout 配置 | 0.7 | Rollout 采样温度（评测仍用 0.0） |
 | top_p | rollout 配置 | 0.95 | Nucleus sampling |
 | max_new_tokens | `data.max_response_length` | 2048 | 最大生成长度 |
@@ -507,9 +526,9 @@ reward = clip(reward, -1, 1)
 
 | 参数 | verl 配置键 | 建议值 |
 |------|------------|--------|
-| use_kl_loss | `actor_rollout_ref.actor.use_kl_loss` | `True` |
-| kl_loss_coef | `actor_rollout_ref.actor.kl_loss_coef` | `0.001` |
-| kl_loss_type | `actor_rollout_ref.actor.kl_loss_type` | `low_var_kl` |
+| use_kl_loss | `actor_rollout_ref.actor.use_kl_loss` | `False`（主线）；漂移时 rescue 设为 `True` |
+| kl_loss_coef | `actor_rollout_ref.actor.kl_loss_coef` | 主线不启用；rescue 用 `0.001` |
+| kl_loss_type | `actor_rollout_ref.actor.kl_loss_type` | `low_var_kl`（仅 rescue 相关） |
 
 #### Optimizer / PPO
 
@@ -523,48 +542,61 @@ reward = clip(reward, -1, 1)
 
 ### 6.3 verl GRPO 配置示例
 
-参考 `examples/grpo_trainer/run_qwen2-7b.sh`：
+当前 README 中的示例按**当前正式主线 A1**同步，权威定义仍以
+`phase_2_ GRPO/algorithm_decision_guide.md`
+为准：
 
 ```bash
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$DATA_DIR/train.parquet \
-    data.val_files=$DATA_DIR/val.parquet \
-    data.train_batch_size=1024 \
+    data.val_files="[$DATA_DIR/val_tier1.parquet,$DATA_DIR/val_tier2.parquet]" \
+    data.train_batch_size=8 \
     data.max_prompt_length=1024 \
-    data.max_response_length=2048 \
+    data.max_response_length=512 \
     \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-Coder-7B-Instruct \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.clip_ratio=0.2 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.entropy_coeff=0 \
     \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=True \
     \
+    reward_manager.name=batch \
+    reward_model.use_reward_loop=False \
+    reward_model.launch_reward_fn_async=False \
     algorithm.use_kl_in_reward=False \
     algorithm.norm_adv_by_std_in_grpo=True \
+    +filter_groups.enable=false \
     \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.total_epochs=15 \
-    trainer.save_freq=20 \
+    trainer.total_training_steps=10 \
+    trainer.val_before_train=True \
+    trainer.save_freq=5 \
     trainer.test_freq=5 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name=rlvr_coding_model \
-    trainer.experiment_name=grpo_dense_seed0
+    trainer.experiment_name=grpo_formal_a1
 ```
+
+正式入口脚本：
+
+- `run_grpo_formal.sh`：共享 formal 主脚本
+- `run_grpo_a0.sh` / `run_grpo_a1.sh` / `run_grpo_a2.sh`：三条算法薄封装
+- `run_grpo_step_smoke.sh`：继续保留为 infra bring-up / stability smoke
 
 ### 6.4 GRPO vs PPO 的关键区别
 
@@ -573,7 +605,7 @@ python3 -m verl.trainer.main_ppo \
 | Critic | 需要单独训练的 Value Network | **不需要** |
 | Advantage | GAE (基于 V(s)) | Group-relative (基于组内 reward 均值) |
 | KL 约束 | KL 加在 reward 里 | **KL 加在 loss 里** |
-| 采样 | 通常 n=1 | n>1 (如 n=5)，每个 prompt 多条采样 |
+| 采样 | 通常 n=1 | n>1 (当前主线如 n=8)，每个 prompt 多条采样 |
 | 配置 | 需要 critic 相关参数 | 不需要 critic 参数 |
 
 ### 6.5 三个必答复现性问题

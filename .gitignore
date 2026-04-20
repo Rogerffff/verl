@@ -131,3 +131,37 @@ logs
 log
 outputs
 .history
+
+# local checkpoint archives (large binaries, not for git)
+/checkpoint_archives/
+
+# accidental shell-output / typo files at repo root
+/0.0
+/0.44
+/0.72
+/0.98
+/126
+/{y}:
+/",step)*
+
+# local temporary scripts and analysis
+/.tmp_*
+/tmp_*.sh
+/get_batch*.py
+/solve[0-9].py
+/solve[0-9][0-9].py
+
+# coding_model_project: bulk data / logs / run artifacts (too large for git)
+coding_model_project/phase_2_ GRPO/remote_logs/
+coding_model_project/phase_2_ GRPO/output/
+coding_model_project/phase_2_ GRPO/sft_repair_data/
+coding_model_project/phase_2_ GRPO/reject_audit/
+coding_model_project/phase_2_ GRPO/reject_audit_with_cases/
+coding_model_project/phase_2_ GRPO/reject_audit_outputs_actionable_with_cases/
+coding_model_project/phase_2_ GRPO/teacher_generation_outputs/
+coding_model_project/phase_2_ GRPO/teacher_generation_shards/
+coding_model_project/phase_2_ GRPO/curriculum_assets/
+coding_model_project/phase_2_ GRPO/repair_analysis/
+coding_model_project/phase_2_ GRPO/review_assets/
+coding_model_project/data/quarantine_audit/
+coding_model_project/data/problem_quarantine_v*.json

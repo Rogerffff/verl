@@ -304,18 +304,22 @@ class FSDPSFTTrainer:
         )
 
         # 构建验证 DataLoader（不 shuffle，使用 micro_batch_size）
-        self.val_sampler = DistributedSampler(
-            self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
-        )
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=config.data.micro_batch_size_per_gpu,  # 验证时用 micro batch size
-            sampler=self.val_sampler,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=True,
-            pin_memory_device=device_name,
-        )
+        if self.val_dataset is not None:
+            self.val_sampler = DistributedSampler(
+                self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
+            )
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=config.data.micro_batch_size_per_gpu,  # 验证时用 micro batch size
+                sampler=self.val_sampler,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=True,
+                pin_memory_device=device_name,
+            )
+        else:
+            self.val_sampler = None
+            self.val_dataloader = None
 
     def _build_model_optimizer(self):
         """
@@ -661,7 +665,9 @@ class FSDPSFTTrainer:
             if self.config.data.balance_dp_token:
                 # 在所有 dp rank 间聚合有效 token 数，确保每个 rank 的损失权重一致
                 torch.distributed.all_reduce(valid_token_this_rank)
-                dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
+                # Some PyTorch builds lose named mesh dims when querying size() in this path,
+                # so use the dp axis index directly for Ulysses meshes.
+                dp_size = self.ulysses_device_mesh.size(0) if use_sp else torch.distributed.get_world_size()
             else:
                 dp_size = 1
 
@@ -1054,11 +1060,14 @@ class FSDPSFTTrainer:
 
                 # 判断是否需要验证或保存
                 is_last_step = global_step >= self.total_training_steps
-                is_valid_step = global_step % self.config.trainer.test_freq == 0
+                is_valid_step = (
+                    self.config.trainer.test_freq > 0
+                    and global_step % self.config.trainer.test_freq == 0
+                )
                 is_save_step = global_step % self.config.trainer.save_freq == 0
 
                 # ========== 验证阶段 ==========
-                if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
+                if (is_last_step and self.val_dataloader is not None) or is_valid_step:
                     val_losses = []
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
@@ -1133,9 +1142,12 @@ def run_sft(config):
     train_dataset = create_sft_dataset(
         config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
     )
-    val_dataset = create_sft_dataset(
-        config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
-    )
+    if config.data.val_files:
+        val_dataset = create_sft_dataset(
+            config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
+        )
+    else:
+        val_dataset = None
 
     # 创建训练器并开始训练
     trainer = FSDPSFTTrainer(
